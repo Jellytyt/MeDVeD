@@ -224,3 +224,11 @@ _test_*.json
 .sixth/
 memory/
 
+# Personal data safety net.
+# Real user data lives in %LOCALAPPDATA%\vless_manager, NOT in this folder —
+# but these rules block any accidental copy of profiles/settings into the repo.
+profiles.json
+settings.json
+data/
+vless_manager/
+
