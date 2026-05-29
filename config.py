@@ -10,6 +10,7 @@ def build_sing_box_config(
     profiles,
     bypass_ru: bool = False,
     process_rules: List[Dict[str, str]] | None = None,
+    routing_rules: List[Dict[str, str]] | None = None,
     use_urltest: bool = True,
     urltest_interval: str = "5m",
 ) -> Dict[str, Any]:
@@ -68,6 +69,26 @@ def build_sing_box_config(
         if not name or direction not in ("direct", "proxy"):
             continue
         rules.append({"process_name": name, "outbound": direction})
+
+    # User-defined routing rules. kind is one of: domain, domain_suffix,
+    # domain_keyword, ip_cidr, port. action is one of: direct, proxy, block.
+    for rule in (routing_rules or []):
+        kind = (rule.get("kind") or "").strip()
+        value = (rule.get("value") or "").strip()
+        action = (rule.get("action") or "direct").strip()
+        if not kind or not value or action not in ("direct", "proxy", "block"):
+            continue
+        if kind == "port":
+            try:
+                value_typed: Any = int(value)
+            except ValueError:
+                continue
+        else:
+            value_typed = value
+        if action == "block":
+            rules.append({kind: value_typed, "action": "reject"})
+        else:
+            rules.append({kind: value_typed, "outbound": action})
 
     if bypass_ru:
         rules.append({"rule_set": ["geosite-ru", "geoip-ru"], "outbound": "direct"})
@@ -189,6 +210,25 @@ def _build_outbound(profile: VlessProfile) -> Dict[str, Any]:
             "method": profile.method,
             "password": profile.password,
         }
+
+    if proto == "tuic":
+        return _prune_none_values({
+            "type": "tuic",
+            "tag": "proxy",
+            "server": profile.server,
+            "server_port": profile.port,
+            "uuid": profile.uuid,
+            "password": profile.password,
+            "congestion_control": profile.congestion_control or "bbr",
+            "udp_relay_mode": profile.udp_relay_mode or "native",
+            "zero_rtt_handshake": False,
+            "tls": {
+                "enabled": True,
+                "server_name": profile.sni or profile.server,
+                "insecure": bool(profile.insecure),
+                "alpn": _split_csv(profile.alpn) if profile.alpn else ["h3"],
+            },
+        })
 
     if proto == "hysteria2":
         obfs_block = None

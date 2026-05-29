@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List  # noqa: F401
 
 
 @dataclass
@@ -32,6 +32,8 @@ class VlessProfile:
     insecure: bool = False
     obfs: str = ""
     obfs_password: str = ""
+    congestion_control: str = ""
+    udp_relay_mode: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -68,6 +70,8 @@ class VlessProfile:
             insecure=bool(data.get("insecure", False)),
             obfs=str(data.get("obfs", "")),
             obfs_password=str(data.get("obfs_password", "")),
+            congestion_control=str(data.get("congestion_control", "")),
+            udp_relay_mode=str(data.get("udp_relay_mode", "")),
         )
 
 
@@ -84,7 +88,13 @@ class AppSettings:
     bypass_ru: bool = False
     kill_switch: bool = False
     urltest_auto_switch: bool = True
+    auto_start_with_windows: bool = False
+    start_minimized: bool = False
+    appearance_mode: str = "dark"
+    language: str = "ru"
+    subscription_info: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     process_rules: List[Dict[str, str]] = field(default_factory=list)
+    routing_rules: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -107,9 +117,26 @@ class AppSettings:
             bypass_ru=bool(data.get("bypass_ru", False)),
             kill_switch=bool(data.get("kill_switch", False)),
             urltest_auto_switch=bool(data.get("urltest_auto_switch", True)),
+            auto_start_with_windows=bool(data.get("auto_start_with_windows", False)),
+            start_minimized=bool(data.get("start_minimized", False)),
+            appearance_mode=str(data.get("appearance_mode", "dark")),
+            language=str(data.get("language", "ru")),
+            subscription_info={
+                str(k): dict(v) for k, v in (data.get("subscription_info") or {}).items()
+                if isinstance(v, dict)
+            },
             process_rules=[
                 {"process_name": str(r.get("process_name", "")), "outbound": str(r.get("outbound", "direct"))}
                 for r in (data.get("process_rules") or [])
                 if isinstance(r, dict)
+            ],
+            routing_rules=[
+                {
+                    "kind": str(r.get("kind", "domain_suffix")),
+                    "value": str(r.get("value", "")),
+                    "action": str(r.get("action", "direct")),
+                }
+                for r in (data.get("routing_rules") or [])
+                if isinstance(r, dict) and r.get("value")
             ],
         )

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from models import VlessProfile
 
 
-_SUPPORTED_PREFIXES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+_SUPPORTED_PREFIXES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "tuic://")
 
 
 def parse_link(link: str, default_name: str = "Imported", source_url: str = "") -> VlessProfile:
@@ -25,6 +25,8 @@ def parse_link(link: str, default_name: str = "Imported", source_url: str = "") 
         return parse_ss_link(text, default_name, source_url)
     if text.startswith(("hysteria2://", "hy2://")):
         return parse_hysteria2_link(text, default_name, source_url)
+    if text.startswith("tuic://"):
+        return parse_tuic_link(text, default_name, source_url)
     raise ValueError(f"Unsupported link scheme. Expected one of: {', '.join(_SUPPORTED_PREFIXES)}")
 
 
@@ -261,6 +263,43 @@ def parse_hysteria2_link(link: str, default_name: str = "Imported Hysteria2", so
         insecure=query.get("insecure", "") in ("1", "true"),
         obfs=query.get("obfs", ""),
         obfs_password=query.get("obfs-password", ""),
+    )
+
+
+def parse_tuic_link(link: str, default_name: str = "Imported TUIC", source_url: str = "") -> VlessProfile:
+    """TUIC v5 link: tuic://UUID:PASSWORD@host:port?congestion_control=bbr&udp_relay_mode=native&alpn=h3#name"""
+    text = link.strip()
+    if not text.startswith("tuic://"):
+        raise ValueError("Link must start with tuic://")
+    parsed = urlparse(text)
+    if not parsed.username:
+        raise ValueError("Missing UUID in TUIC link")
+    uuid = unquote(parsed.username)
+    password = unquote(parsed.password or "")
+    server = parsed.hostname or ""
+    if not server:
+        raise ValueError("Missing server host in TUIC link")
+    port = parsed.port or 443
+    remark = unquote(parsed.fragment or "") or default_name
+    query = _get_query_map(parsed.query)
+
+    return VlessProfile(
+        name=remark,
+        uuid=uuid,
+        server=server,
+        port=port,
+        security="tls",
+        sni=query.get("sni", query.get("peer", "")),
+        alpn=query.get("alpn", "h3"),
+        type="udp",
+        remark=remark,
+        enabled=True,
+        source_url=source_url,
+        protocol="tuic",
+        password=password,
+        insecure=query.get("allow_insecure", query.get("insecure", "")) in ("1", "true"),
+        congestion_control=query.get("congestion_control", "bbr"),
+        udp_relay_mode=query.get("udp_relay_mode", "native"),
     )
 
 
