@@ -18,7 +18,7 @@ import urllib.request
 import zipfile
 from collections import deque
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, Menu, StringVar, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, Menu, StringVar, filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import customtkinter as ctk
@@ -38,8 +38,74 @@ from parser import parse_link, profile_to_vless_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 GITHUB_REPO = "Jellytyt/MeDVeD"
+
+
+_TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "ru": {
+        "connect": "Подключиться",
+        "connected": "Подключено",
+        "active_server": "Активный сервер:",
+        "server": "Сервер:",
+        "profiles_page": "Профили и подписки",
+        "log_page": "Журнал",
+        "settings_page": "Настройки",
+        "back": "← Назад",
+        "quit": "✕  Выход",
+        "save": "Сохранить",
+        "delete": "Удалить",
+        "import": "Импорт",
+        "export": "Экспорт",
+        "speedtest": "Speedtest",
+        "check_pings": "Проверить пинги",
+        "copy_link": "Скопировать ссылку",
+        "no_profiles_title": "Нет профилей",
+        "no_profiles_body": "Откройте «Профили и подписки» в меню и добавьте сервер или подписку.",
+        "auto_label_switch": "Авто (быстрейший из всех)",
+        "auto_label_fixed": "Авто (лучший на старте)",
+        "auto_label_fixed_to": "Авто (фикс: {name})",
+        "update_check": "Проверить обновления",
+        "update_available": "🔄  Обновить до {version}",
+        "checking_updates": "Проверяю обновления…",
+        "up_to_date": "У тебя последняя версия (v{version})",
+        "lang_change_restart": "Перезапустите MeDVeD чтобы сменить язык интерфейса.",
+    },
+    "en": {
+        "connect": "Connect",
+        "connected": "Connected",
+        "active_server": "Active server:",
+        "server": "Server:",
+        "profiles_page": "Profiles & subscriptions",
+        "log_page": "Log",
+        "settings_page": "Settings",
+        "back": "← Back",
+        "quit": "✕  Quit",
+        "save": "Save",
+        "delete": "Delete",
+        "import": "Import",
+        "export": "Export",
+        "speedtest": "Speedtest",
+        "check_pings": "Test pings",
+        "copy_link": "Copy link",
+        "no_profiles_title": "No profiles",
+        "no_profiles_body": "Open “Profiles & subscriptions” in the menu and add a server or subscription.",
+        "auto_label_switch": "Auto (fastest server)",
+        "auto_label_fixed": "Auto (best on start)",
+        "auto_label_fixed_to": "Auto (locked: {name})",
+        "update_check": "Check for updates",
+        "update_available": "🔄  Update to {version}",
+        "checking_updates": "Checking updates…",
+        "up_to_date": "You have the latest version (v{version})",
+        "lang_change_restart": "Restart MeDVeD to apply the new language.",
+    },
+}
+
+
+def _t_for(lang: str, key: str, **kwargs: Any) -> str:
+    table = _TRANSLATIONS.get(lang) or _TRANSLATIONS["ru"]
+    text = table.get(key) or _TRANSLATIONS["ru"].get(key, key)
+    return text.format(**kwargs) if kwargs else text
 
 
 def _parse_version(value: str) -> tuple:
@@ -225,6 +291,36 @@ def _activate_existing_window(title: str) -> bool:
         return False
 
 
+_AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_VALUE_NAME = "MeDVeD"
+
+
+def _set_autostart(enabled: bool, start_minimized: bool) -> Optional[str]:
+    """Toggle 'launch on Windows boot' via HKCU\\...\\Run. Returns error or None."""
+    if os.name != "nt":
+        return "Только Windows"
+    if not getattr(sys, "frozen", False):
+        # In dev mode there's no exe to autostart — skip silently.
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE,
+        ) as key:
+            if enabled:
+                exe = str(Path(sys.executable).resolve())
+                cmd = f'"{exe}" --minimized' if start_minimized else f'"{exe}"'
+                winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        return None
+    except Exception as error:
+        return f"{type(error).__name__}: {error}"
+
+
 def _asset_path(name: str) -> Path:
     """Resolve a file in the assets/ folder, both in dev and frozen builds."""
     if getattr(sys, "frozen", False):
@@ -325,6 +421,16 @@ class RoundButton:
             self.canvas.itemconfig(self._text_id, text=text)
         self.canvas.itemconfig(self._circle, fill=self._current_color())
 
+    def update_background(self, bg_color: str, text_color: Optional[str] = None) -> None:
+        """Repaint the canvas background to match a changed app theme so the
+        button doesn't sit on a grey square. Optionally re-color the label too."""
+        try:
+            self.canvas.configure(bg=bg_color)
+            if text_color is not None:
+                self.canvas.itemconfig(self._text_id, fill=text_color)
+        except Exception:
+            pass
+
 
 class VlessApp(ctk.CTk):
     def __init__(self) -> None:
@@ -336,9 +442,9 @@ class VlessApp(ctk.CTk):
             self.iconbitmap(default=str(_asset_path("medved.ico")))
         except Exception:
             pass
-        self._apply_dark_ttk_style()
 
         self.settings = load_settings()
+        self._apply_ttk_style()
         self.profiles: List[VlessProfile] = load_profiles(self.settings)
         self.process: Optional[subprocess.Popen[str]] = None
         self._process_lock = threading.Lock()
@@ -386,6 +492,10 @@ class VlessApp(ctk.CTk):
         self.bypass_ru_var = BooleanVar(value=self.settings.bypass_ru)
         self.kill_switch_var = BooleanVar(value=self.settings.kill_switch)
         self.urltest_auto_switch_var = BooleanVar(value=self.settings.urltest_auto_switch)
+        self.autostart_var = BooleanVar(value=self.settings.auto_start_with_windows)
+        self.start_minimized_var = BooleanVar(value=self.settings.start_minimized)
+        self.appearance_var = StringVar(value=self.settings.appearance_mode)
+        self.language_var = StringVar(value=self.settings.language)
 
         # Stats display variables
         self.dl_speed_var = StringVar(value="—")
@@ -405,16 +515,51 @@ class VlessApp(ctk.CTk):
         if getattr(sys, "frozen", False) and not GITHUB_REPO.startswith("USERNAME/"):
             self.after(5000, lambda: threading.Thread(target=self._check_for_update, daemon=True).start())
 
-    def _apply_dark_ttk_style(self) -> None:
+    def _resolved_bg_color(self) -> str:
+        """Pick a hex bg matching the current CTk theme, for tk.Canvas children
+        (which can't be transparent and need a solid color to blend in)."""
+        try:
+            return self._apply_appearance_mode(ctk.ThemeManager.theme["CTk"]["fg_color"])
+        except Exception:
+            return "#242424" if self._resolve_appearance_mode() == "dark" else "#fafafa"
+
+    def _refresh_main_button_background(self) -> None:
+        btn = getattr(self, "main_button", None)
+        if btn is None:
+            return
+        btn.update_background(self._resolved_bg_color())
+
+    def _resolve_appearance_mode(self) -> str:
+        """Return concrete 'dark' or 'light' even when settings say 'system'."""
+        mode = self.settings.appearance_mode
+        if mode in ("dark", "light"):
+            return mode
+        try:
+            return ctk.get_appearance_mode().lower()
+        except Exception:
+            return "dark"
+
+    def _apply_ttk_style(self) -> None:
+        """Style ttk widgets (Treeview, Spinbox) to match the current CTk theme.
+        Called on startup and every time the theme is switched in settings."""
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except Exception:
             pass
-        bg = "#212121"
-        bg_alt = "#2b2b2b"
-        fg = "#e0e0e0"
-        accent = "#1f6aa5"
+        mode = self._resolve_appearance_mode()
+        if mode == "light":
+            bg = "#fafafa"
+            bg_alt = "#e8e8e8"
+            fg = "#1a1a1a"
+            accent = "#1f6aa5"
+            heading_hover_bg = "#d4d4d4"
+        else:
+            bg = "#212121"
+            bg_alt = "#2b2b2b"
+            fg = "#e0e0e0"
+            accent = "#1f6aa5"
+            heading_hover_bg = "#3a3a3a"
         style.configure(
             "Dark.Treeview",
             background=bg, foreground=fg, fieldbackground=bg,
@@ -429,6 +574,11 @@ class VlessApp(ctk.CTk):
             "Dark.Treeview",
             background=[("selected", accent)],
             foreground=[("selected", "#ffffff")],
+        )
+        style.map(
+            "Dark.Treeview.Heading",
+            background=[("active", heading_hover_bg)],
+            foreground=[("active", fg)],
         )
         style.layout("Dark.Treeview", style.layout("Treeview"))
         style.configure(
@@ -515,7 +665,7 @@ class VlessApp(ctk.CTk):
         button_box = ctk.CTkFrame(body, fg_color="transparent")
         button_box.pack(fill=BOTH, expand=True)
 
-        ctk.CTkLabel(button_box, text="Сервер:", font=ctk.CTkFont(size=11), text_color="#888888").pack(pady=(8, 0))
+        ctk.CTkLabel(button_box, text=self._t("server"), font=ctk.CTkFont(size=11), text_color="#888888").pack(pady=(8, 0))
         self.server_button = ctk.CTkButton(
             button_box, text=f"{self._format_choice(self.server_choice_var.get())}  ▼",
             width=320, height=32,
@@ -527,25 +677,26 @@ class VlessApp(ctk.CTk):
         self._server_menu_visible = False
         self._server_dropdown: Optional[Any] = None
 
-        try:
-            bg_color = self._apply_appearance_mode(ctk.ThemeManager.theme["CTk"]["fg_color"])
-        except Exception:
-            bg_color = "#242424"
         self.main_button = RoundButton(
-            button_box, size=220, text="Подключиться",
+            button_box, size=220, text=self._t("connect"),
             fg_color="#3a3a3a", hover_color="#4a4a4a",
             active_color="#2e7d32", active_hover="#388e3c",
-            text_color="#ffffff", bg_color=bg_color, font_size=18,
+            text_color="#ffffff", bg_color=self._resolved_bg_color(), font_size=18,
             command=self._toggle_connection,
         )
         self.main_button.pack(pady=(24, 10))
 
         ctk.CTkLabel(
-            button_box, text="Активный сервер:", font=ctk.CTkFont(size=10), text_color="#888888",
+            button_box, text=self._t("active_server"), font=ctk.CTkFont(size=10), text_color="#888888",
         ).pack(pady=(8, 0))
         ctk.CTkLabel(
             button_box, textvariable=self.active_server_var, font=ctk.CTkFont(size=13, weight="bold"),
         ).pack()
+        self.sub_info_label = ctk.CTkLabel(
+            button_box, text="", font=ctk.CTkFont(size=10), text_color="#888888",
+        )
+        self.sub_info_label.pack(pady=(4, 0))
+        self.after(100, self._refresh_subscription_info_label)
 
         stats_card = ctk.CTkFrame(body, corner_radius=10)
         stats_card.pack(fill=X, pady=(16, 0))
@@ -946,12 +1097,19 @@ class VlessApp(ctk.CTk):
                 request = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(request, timeout=30) as response:
                     payload = response.read().decode("utf-8", errors="ignore")
+                    sub_info_header = response.headers.get("subscription-userinfo") or response.headers.get("Subscription-Userinfo")
+                    if sub_info_header:
+                        self._save_subscription_info(url, sub_info_header)
             except Exception as error:
                 last_error = f"{type(error).__name__}: {error}"
                 continue
 
             decoded = self._decode_subscription_payload(payload)
-            if not any(s in decoded for s in ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")):
+            if not any(s in decoded for s in ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "tuic://")):
+                # Maybe it's Clash YAML
+                clash_profiles = self._try_parse_clash_yaml(decoded, url)
+                if clash_profiles:
+                    return clash_profiles
                 last_payload = decoded[:200]
                 continue
 
@@ -982,6 +1140,54 @@ class VlessApp(ctk.CTk):
             f"Подписка не содержит VLESS-ссылок. Ответ сервера: {last_payload!r}"
         )
 
+    def _save_subscription_info(self, url: str, header_value: str) -> None:
+        """Parse 'upload=N; download=N; total=N; expire=UNIX_TS' and store per-url."""
+        info: Dict[str, int] = {}
+        for part in header_value.split(";"):
+            piece = part.strip()
+            if "=" not in piece:
+                continue
+            k, v = piece.split("=", 1)
+            try:
+                info[k.strip().lower()] = int(v.strip())
+            except (TypeError, ValueError):
+                continue
+        if not info:
+            return
+        self.settings.subscription_info[url] = info
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self.after(0, self._refresh_subscription_info_label)
+
+    def _refresh_subscription_info_label(self) -> None:
+        label = getattr(self, "sub_info_label", None)
+        if label is None:
+            return
+        # Aggregate across all subscriptions
+        used = 0
+        total = 0
+        earliest_expire = None
+        for url in self.settings.subscriptions:
+            info = self.settings.subscription_info.get(url) or {}
+            used += int(info.get("upload", 0)) + int(info.get("download", 0))
+            total += int(info.get("total", 0))
+            ex = int(info.get("expire", 0))
+            if ex > 0 and (earliest_expire is None or ex < earliest_expire):
+                earliest_expire = ex
+        if total <= 0 and earliest_expire is None:
+            label.configure(text="")
+            return
+        parts = []
+        if total > 0:
+            remaining = max(0, total - used)
+            parts.append(f"Осталось: {_format_bytes(remaining)} / {_format_bytes(total)}")
+        if earliest_expire:
+            days_left = max(0, (earliest_expire - int(time.time())) // 86400)
+            parts.append(f"истекает через {days_left} дн.")
+        label.configure(text="   ".join(parts))
+
     @staticmethod
     def _is_fake_profile(profile: VlessProfile) -> bool:
         if profile.server in {"127.0.0.1", "0.0.0.0", "localhost", "::1"}:
@@ -991,6 +1197,98 @@ class VlessApp(ctk.CTk):
             if marker in name_lower:
                 return True
         return False
+
+    def _try_parse_clash_yaml(self, text: str, source_url: str) -> List[VlessProfile]:
+        """Clash/Clash Meta YAML subscriptions have 'proxies:' top-level key.
+        We extract the list and map each proxy dict to a VlessProfile."""
+        if "proxies:" not in text and "proxy-providers:" not in text:
+            return []
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            return []
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        proxies = data.get("proxies") or []
+        if not isinstance(proxies, list):
+            return []
+        result: List[VlessProfile] = []
+        for entry in proxies:
+            if not isinstance(entry, dict):
+                continue
+            profile = self._clash_entry_to_profile(entry, source_url)
+            if profile is not None and not self._is_fake_profile(profile):
+                result.append(profile)
+        return result
+
+    @staticmethod
+    def _clash_entry_to_profile(entry: Dict[str, Any], source_url: str) -> Optional[VlessProfile]:
+        proto = str(entry.get("type", "")).lower()
+        name = str(entry.get("name", "Clash"))
+        server = str(entry.get("server", ""))
+        port = int(entry.get("port", 443) or 443)
+        if not server:
+            return None
+        common = dict(name=name, server=server, port=port, enabled=True, source_url=source_url, remark=name)
+        if proto == "vless":
+            ws_opts = entry.get("ws-opts") or {}
+            reality_opts = entry.get("reality-opts") or {}
+            return VlessProfile(
+                **common, uuid=str(entry.get("uuid", "")), protocol="vless",
+                security="reality" if reality_opts else ("tls" if entry.get("tls") else "none"),
+                flow=str(entry.get("flow", "")), sni=str(entry.get("servername", "") or entry.get("sni", "")),
+                fp=str(entry.get("client-fingerprint", "chrome")),
+                type=str(entry.get("network", "tcp")),
+                path=str(ws_opts.get("path", "")), host=str((ws_opts.get("headers") or {}).get("Host", "")),
+                public_key=str(reality_opts.get("public-key", "")),
+                short_id=str(reality_opts.get("short-id", "")),
+            )
+        if proto == "vmess":
+            ws_opts = entry.get("ws-opts") or {}
+            return VlessProfile(
+                **common, uuid=str(entry.get("uuid", "")), protocol="vmess",
+                security="tls" if entry.get("tls") else "none",
+                sni=str(entry.get("servername", "")),
+                type=str(entry.get("network", "tcp")),
+                path=str(ws_opts.get("path", "")), host=str((ws_opts.get("headers") or {}).get("Host", "")),
+                alter_id=int(entry.get("alterId", 0) or 0),
+            )
+        if proto == "trojan":
+            return VlessProfile(
+                **common, uuid="", protocol="trojan", security="tls",
+                password=str(entry.get("password", "")),
+                sni=str(entry.get("sni", "")),
+                insecure=bool(entry.get("skip-cert-verify", False)),
+            )
+        if proto in ("ss", "shadowsocks"):
+            return VlessProfile(
+                **common, uuid="", protocol="shadowsocks", security="none",
+                password=str(entry.get("password", "")),
+                method=str(entry.get("cipher", "")),
+            )
+        if proto in ("hysteria2", "hy2"):
+            return VlessProfile(
+                **common, uuid="", protocol="hysteria2", security="tls",
+                password=str(entry.get("password", "")),
+                sni=str(entry.get("sni", "")),
+                insecure=bool(entry.get("skip-cert-verify", False)),
+                obfs=str(entry.get("obfs", "")),
+                obfs_password=str(entry.get("obfs-password", "")),
+            )
+        if proto == "tuic":
+            return VlessProfile(
+                **common, uuid=str(entry.get("uuid", "")), protocol="tuic", security="tls",
+                password=str(entry.get("password", "")),
+                sni=str(entry.get("sni", "")),
+                congestion_control=str(entry.get("congestion-controller", "bbr")),
+                udp_relay_mode=str(entry.get("udp-relay-mode", "native")),
+                insecure=bool(entry.get("skip-cert-verify", False)),
+            )
+        return None
 
     def _decode_subscription_payload(self, payload: str) -> str:
         candidate = payload.strip()
@@ -1128,6 +1426,7 @@ class VlessApp(ctk.CTk):
                 connect_target,
                 bypass_ru=self.settings.bypass_ru,
                 process_rules=self.settings.process_rules,
+                routing_rules=self.settings.routing_rules,
                 use_urltest=self.settings.urltest_auto_switch,
             )
         except Exception as error:
@@ -1270,7 +1569,7 @@ class VlessApp(ctk.CTk):
 
     def _update_active_state(self, active: bool) -> None:
         self.active_var.set(active)
-        self.status_var.set("Подключено" if active else "Готово")
+        self.status_var.set(self._t("connected") if active else "Готово")
         if active:
             pending = getattr(self, "_pending_active_name", "")
             if pending:
@@ -1280,7 +1579,7 @@ class VlessApp(ctk.CTk):
             self.active_server_var.set("—")
         self._refresh_tray_icon(active)
         if getattr(self, "main_button", None) is not None:
-            self.main_button.set_state(active, text=("Подключено" if active else "Подключиться"))
+            self.main_button.set_state(active, text=(self._t("connected") if active else self._t("connect")))
 
     def _reset_stats(self) -> None:
         self._prev_rx = 0.0
@@ -1369,6 +1668,7 @@ class VlessApp(ctk.CTk):
                 if isinstance(info, dict):
                     now_tag = info.get("now")
                     if isinstance(now_tag, str) and now_tag != last_now_tag:
+                        is_first = last_now_tag is None
                         last_now_tag = now_tag
                         try:
                             idx = int(now_tag.split("-", 1)[1])
@@ -1377,8 +1677,10 @@ class VlessApp(ctk.CTk):
                         if 0 <= idx < len(self._pending_profiles):
                             name = self._pending_profiles[idx].name
 
-                            def update_name(n=name) -> None:
+                            def update_name(n=name, notify=not is_first) -> None:
                                 self.active_server_var.set(n)
+                                if notify:
+                                    self._show_snackbar(f"Переключён на {n}", "info", duration_ms=2500)
 
                             self.after(0, update_name)
             snapshot = self._api_request("/connections")
@@ -1453,6 +1755,26 @@ class VlessApp(ctk.CTk):
         self.settings.notifications_enabled = bool(self.notifications_var.get())
         self.settings.bypass_ru = bool(self.bypass_ru_var.get())
         self.settings.urltest_auto_switch = bool(self.urltest_auto_switch_var.get())
+        new_appearance = str(self.appearance_var.get())
+        if new_appearance in ("dark", "light", "system") and new_appearance != self.settings.appearance_mode:
+            self.settings.appearance_mode = new_appearance
+            try:
+                ctk.set_appearance_mode(new_appearance)
+            except Exception:
+                pass
+            self._apply_ttk_style()
+            self._refresh_main_button_background()
+        new_language = str(self.language_var.get())
+        if new_language in ("ru", "en") and new_language != self.settings.language:
+            self.settings.language = new_language
+            self._show_snackbar(_t_for(new_language, "lang_change_restart"), "info", duration_ms=5000)
+        self.settings.auto_start_with_windows = bool(self.autostart_var.get())
+        self.settings.start_minimized = bool(self.start_minimized_var.get())
+        autostart_error = _set_autostart(
+            self.settings.auto_start_with_windows, self.settings.start_minimized,
+        )
+        if autostart_error:
+            warnings.append(f"Автозапуск: {autostart_error}")
         was_kill_switch = self.settings.kill_switch
         self.settings.kill_switch = bool(self.kill_switch_var.get())
         if was_kill_switch and not self.settings.kill_switch:
@@ -1508,8 +1830,11 @@ class VlessApp(ctk.CTk):
 
     _AUTO_KEY = "__auto__"
 
+    def _t(self, key: str, **kwargs: Any) -> str:
+        return _t_for(self.settings.language, key, **kwargs)
+
     def _auto_label(self) -> str:
-        return "Авто (быстрейший из всех)" if self.settings.urltest_auto_switch else "Авто (лучший на старте)"
+        return self._t("auto_label_switch") if self.settings.urltest_auto_switch else self._t("auto_label_fixed")
 
     def _format_choice(self, value: str) -> str:
         return self._auto_label() if value == self._AUTO_KEY else value
@@ -1658,8 +1983,11 @@ class VlessApp(ctk.CTk):
             ("Удалить", self.delete_profile),
             ("Скопировать ссылку", self._copy_selected_link),
             ("Проверить пинги", self.test_all_pings),
+            ("Speedtest", self.test_all_speeds),
+            ("Экспорт", self.export_profiles),
+            ("Импорт", self.import_profiles_from_file),
         ]:
-            ctk.CTkButton(actions, text=text, command=cmd, width=150, height=30).pack(side=LEFT, padx=(0, 6))
+            ctk.CTkButton(actions, text=text, command=cmd, width=125, height=30).pack(side=LEFT, padx=(0, 4))
 
         details = self._section(right, "Импорт ссылки")
         details.pack(fill=X)
@@ -1823,8 +2151,12 @@ class VlessApp(ctk.CTk):
         view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self._view_header(view, "Настройки", back=True)
 
-        wrapper = ctk.CTkFrame(view, fg_color="transparent")
-        wrapper.pack(fill=BOTH, expand=True, padx=16, pady=(0, 16))
+        # Bottom button bar stays outside the scrollable area so it never disappears.
+        bottom = ctk.CTkFrame(view, fg_color="transparent")
+        bottom.pack(fill=X, side="bottom", padx=16, pady=(0, 16))
+
+        wrapper = ctk.CTkScrollableFrame(view, fg_color="transparent")
+        wrapper.pack(fill=BOTH, expand=True, padx=16, pady=(0, 8))
 
         ctk.CTkLabel(wrapper, text="Путь к sing-box", font=ctk.CTkFont(size=11)).pack(anchor="w")
         self.singbox_entry = ctk.CTkEntry(wrapper, textvariable=self.settings_path_var)
@@ -1833,12 +2165,28 @@ class VlessApp(ctk.CTk):
 
         for text, var in [
             ("Автоподключение к выбранному профилю при запуске", self.auto_connect_var),
+            ("Запускать MeDVeD автоматически при старте Windows", self.autostart_var),
+            ("Стартовать свёрнутым в трей", self.start_minimized_var),
             ("Системные уведомления (ошибки VPN, обновление подписок)", self.notifications_var),
             ("Российские сайты в обход VPN (geosite-ru + geoip-ru)", self.bypass_ru_var),
             ("Kill switch (блокировать интернет при падении VPN)", self.kill_switch_var),
             ("Авто-режим: переподключаться к быстрейшему серверу каждые 5 мин", self.urltest_auto_switch_var),
         ]:
             ctk.CTkCheckBox(wrapper, text=text, variable=var).pack(anchor="w", pady=4)
+
+        # Theme + language row
+        appearance_row = ctk.CTkFrame(wrapper, fg_color="transparent")
+        appearance_row.pack(fill=X, pady=(10, 0))
+        ctk.CTkLabel(appearance_row, text="Тема:").pack(side=LEFT)
+        ctk.CTkOptionMenu(
+            appearance_row, variable=self.appearance_var,
+            values=["dark", "light", "system"], width=110,
+        ).pack(side=LEFT, padx=(6, 16))
+        ctk.CTkLabel(appearance_row, text="Язык:").pack(side=LEFT)
+        ctk.CTkOptionMenu(
+            appearance_row, variable=self.language_var,
+            values=["ru", "en"], width=70,
+        ).pack(side=LEFT, padx=6)
 
         refresh_row = ctk.CTkFrame(wrapper, fg_color="transparent")
         refresh_row.pack(fill=X, pady=(10, 0))
@@ -1899,16 +2247,127 @@ class VlessApp(ctk.CTk):
         ctk.CTkButton(proc_buttons, text="+ Добавить", command=add_rule, width=110, height=30).pack(pady=(0, 6))
         ctk.CTkButton(proc_buttons, text="− Удалить", command=remove_rule, width=110, height=30, fg_color="#7a3a3a").pack()
 
-        buttons = ctk.CTkFrame(wrapper, fg_color="transparent")
-        buttons.pack(fill=X, side="bottom", pady=(16, 0))
-        ctk.CTkButton(buttons, text="Сохранить", command=self.save_app_settings, height=34).pack(side=RIGHT)
+        # ---------- Routing rules (domain / IP / port → direct/proxy/block) ----------
+        ctk.CTkLabel(
+            wrapper, text="Правила маршрутизации (домены, IP, порты)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", pady=(20, 4))
+        ctk.CTkLabel(
+            wrapper, text="Куда отправлять трафик по домену, IP-подсети или порту",
+            font=ctk.CTkFont(size=10), text_color="#aaaaaa",
+        ).pack(anchor="w")
+
+        route_holder = ctk.CTkFrame(wrapper, fg_color="transparent")
+        route_holder.pack(fill=BOTH, expand=True, pady=(6, 0))
+        route_tree = ttk.Treeview(
+            route_holder, columns=("kind", "value", "action"), show="headings",
+            selectmode="browse", style="Dark.Treeview", height=6,
+        )
+        route_tree.heading("kind", text="Тип")
+        route_tree.heading("value", text="Значение")
+        route_tree.heading("action", text="Действие")
+        route_tree.column("kind", width=140, anchor="center")
+        route_tree.column("value", width=260, anchor="w")
+        route_tree.column("action", width=100, anchor="center")
+        route_tree.pack(side=LEFT, fill=BOTH, expand=True)
+
+        def reload_route_tree() -> None:
+            for item in route_tree.get_children():
+                route_tree.delete(item)
+            for index, rule in enumerate(self.settings.routing_rules):
+                route_tree.insert("", END, iid=str(index), values=(
+                    rule.get("kind", ""), rule.get("value", ""), rule.get("action", ""),
+                ))
+
+        reload_route_tree()
+
+        route_buttons = ctk.CTkFrame(route_holder, fg_color="transparent")
+        route_buttons.pack(side=RIGHT, fill=Y, padx=(8, 0))
+
+        def add_route_rule() -> None:
+            self._prompt_routing_rule(on_done=reload_route_tree)
+
+        def remove_route_rule() -> None:
+            selection = route_tree.selection()
+            if not selection:
+                return
+            try:
+                index = int(selection[0])
+            except ValueError:
+                return
+            if 0 <= index < len(self.settings.routing_rules):
+                self.settings.routing_rules.pop(index)
+                reload_route_tree()
+
+        ctk.CTkButton(route_buttons, text="+ Добавить", command=add_route_rule, width=110, height=30).pack(pady=(0, 6))
+        ctk.CTkButton(route_buttons, text="− Удалить", command=remove_route_rule, width=110, height=30, fg_color="#7a3a3a").pack()
+
+        # ---------- Bottom button bar (Save / Check updates) ----------
+        ctk.CTkButton(bottom, text="Сохранить", command=self.save_app_settings, height=34).pack(side=RIGHT)
         ctk.CTkButton(
-            buttons, text=f"Проверить обновления  (v{__version__})",
+            bottom, text=f"Проверить обновления  (v{__version__})",
             command=self._manual_check_for_update, height=34,
             fg_color="#3a3a3a", hover_color="#4a4a4a",
         ).pack(side=LEFT)
 
         self._views["settings"] = view
+
+    _ROUTING_KIND_LABELS = [
+        ("domain_suffix", "Поддомен (example.com)"),
+        ("domain", "Точный домен"),
+        ("domain_keyword", "Слово в домене"),
+        ("ip_cidr", "IP / подсеть (1.2.3.0/24)"),
+        ("port", "Порт"),
+    ]
+
+    def _prompt_routing_rule(self, on_done) -> None:
+        kind_var = StringVar(value="domain_suffix")
+        value_var = StringVar()
+        action_var = StringVar(value="proxy")
+
+        def build_body(card: "ctk.CTkFrame") -> None:
+            ctk.CTkLabel(card, text="Тип правила", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 4))
+            kind_to_label = {k: label for k, label in self._ROUTING_KIND_LABELS}
+            label_to_kind = {label: k for k, label in self._ROUTING_KIND_LABELS}
+            display_var = StringVar(value=kind_to_label[kind_var.get()])
+
+            def on_change(value: str) -> None:
+                kind_var.set(label_to_kind.get(value, "domain_suffix"))
+
+            ctk.CTkOptionMenu(
+                card, variable=display_var, values=[lbl for _, lbl in self._ROUTING_KIND_LABELS],
+                command=on_change, width=300,
+            ).pack(anchor="w", padx=20)
+
+            ctk.CTkLabel(card, text="Значение", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(12, 4))
+            entry = ctk.CTkEntry(card, textvariable=value_var)
+            entry.pack(fill=X, padx=20)
+            _bind_clipboard_shortcuts(entry)
+            entry.focus_set()
+
+            ctk.CTkLabel(card, text="Действие", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(12, 4))
+            row = ctk.CTkFrame(card, fg_color="transparent")
+            row.pack(anchor="w", padx=20)
+            ctk.CTkRadioButton(row, text="через VPN", variable=action_var, value="proxy").pack(side=LEFT, padx=(0, 12))
+            ctk.CTkRadioButton(row, text="напрямую", variable=action_var, value="direct").pack(side=LEFT, padx=(0, 12))
+            ctk.CTkRadioButton(row, text="блокировать", variable=action_var, value="block").pack(side=LEFT)
+
+        def on_ok() -> None:
+            value = value_var.get().strip()
+            if not value:
+                return
+            self.settings.routing_rules.append({
+                "kind": kind_var.get(),
+                "value": value,
+                "action": action_var.get(),
+            })
+            on_done()
+
+        self._show_overlay(
+            title="Добавить правило маршрутизации",
+            build_body=build_body,
+            buttons=[("Добавить", on_ok, "primary"), ("Отмена", None, "secondary")],
+        )
 
     def _prompt_process_rule(self, on_done) -> None:
         name_var = StringVar()
@@ -1951,27 +2410,37 @@ class VlessApp(ctk.CTk):
 
     def _dismiss_overlay(self) -> None:
         overlay = getattr(self, "_overlay", None)
-        if overlay is not None:
-            try:
-                overlay.destroy()
-            except Exception:
-                pass
-            self._overlay = None
-            self._overlay_result_var = None
+        card = getattr(self, "_overlay_card", None)
+        for widget in (card, overlay):
+            if widget is not None:
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+        self._overlay = None
+        self._overlay_card = None
+        self._overlay_result_var = None
 
     def _show_overlay(self, title: str, build_body, buttons, accent: str = "info") -> None:
         """Generic in-app overlay. `buttons` is a list of (label, callback_or_None, kind)
         where kind is 'primary' | 'secondary' | 'danger'. Callbacks are called *before*
-        the overlay closes; pass None for just-close buttons."""
-        self._dismiss_overlay()
-        overlay = ctk.CTkFrame(self, fg_color="#000000", corner_radius=0)
-        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-        # Block interaction with underlying widgets
-        overlay.bind("<Button-1>", lambda _e: None)
-        self._overlay = overlay
+        the overlay closes; pass None for just-close buttons.
 
-        card = ctk.CTkFrame(overlay, corner_radius=14, fg_color="#252525")
+        No darkening backdrop on purpose — Tk widgets can't be alpha-blended, and
+        an opaque dimmer would hide the rest of the UI. Instead the card floats
+        with a subtle border, leaving the underlying content fully visible."""
+        self._dismiss_overlay()
+        self._overlay = None
+
+        card = ctk.CTkFrame(
+            self, corner_radius=14,
+            fg_color=("#f0f0f0", "#252525"),
+            border_width=2,
+            border_color=("#bbbbbb", "#3a3a3a"),
+        )
         card.place(relx=0.5, rely=0.5, anchor="center")
+        card.lift()
+        self._overlay_card = card
 
         ctk.CTkLabel(
             card, text=title, font=ctk.CTkFont(size=15, weight="bold"),
@@ -2009,6 +2478,7 @@ class VlessApp(ctk.CTk):
             ctk.CTkLabel(
                 card, text=message, font=ctk.CTkFont(size=12),
                 justify="left", wraplength=420,
+                text_color=("#1a1a1a", "#e0e0e0"),
             ).pack(anchor="w", padx=20, pady=(4, 12))
         self._show_overlay(title, build_body, [("ОК", None, "primary")], accent=kind)
 
@@ -2059,6 +2529,7 @@ class VlessApp(ctk.CTk):
             ctk.CTkLabel(
                 card, text=message, font=ctk.CTkFont(size=12),
                 justify="left", wraplength=420,
+                text_color=("#1a1a1a", "#e0e0e0"),
             ).pack(anchor="w", padx=20, pady=(4, 12))
 
         yes_kind = "danger" if danger else "primary"
@@ -2067,8 +2538,8 @@ class VlessApp(ctk.CTk):
             [("Да", lambda: result_var.set(True), yes_kind), ("Нет", None, "secondary")],
             accent=("error" if danger else "warn"),
         )
-        if self._overlay is not None:
-            self.wait_window(self._overlay)
+        if self._overlay_card is not None:
+            self.wait_window(self._overlay_card)
         return bool(result_var.get())
 
     # ========== TRAY / STARTUP / EXPORT ==========
@@ -2171,6 +2642,121 @@ class VlessApp(ctk.CTk):
             self.after(0, self.log, "Проверка пинга завершена")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def test_all_speeds(self) -> None:
+        """TCP-download speedtest against each server's host:port. Measures raw
+        throughput by reading from the open socket — works for any open TCP port
+        without needing a special endpoint. Approximation, but reflects real
+        latency × bandwidth."""
+        if not self.profiles:
+            self._show_toast("MeDVeD", "Нет профилей для проверки.", "info")
+            return
+        self.log(f"Speedtest: {len(self.profiles)} серверов...")
+        snapshot = list(self.profiles)
+
+        def measure(host: str, port: int, duration: float = 2.0) -> Optional[float]:
+            try:
+                start = time.perf_counter()
+                with socket.create_connection((host, port), timeout=4.0) as sock:
+                    sock.settimeout(duration + 1.0)
+                    # Send a generic TLS ClientHello-ish ping so the server keeps
+                    # the socket open and we get bytes back.
+                    sock.sendall(b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00")
+                    received = 0
+                    while time.perf_counter() - start < duration:
+                        try:
+                            chunk = sock.recv(65536)
+                        except socket.timeout:
+                            break
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                    elapsed = time.perf_counter() - start
+                if elapsed <= 0 or received == 0:
+                    return None
+                return (received * 8) / elapsed / 1000.0  # kbps
+            except (OSError, socket.timeout):
+                return None
+
+        def worker() -> None:
+            for profile in snapshot:
+                kbps = measure(profile.server, profile.port)
+                label = "—" if kbps is None else (f"{kbps/1000:.1f} Мбит/с" if kbps >= 1000 else f"{kbps:.0f} Кбит/с")
+                key = self._profile_ping_key(profile)
+                self.after(0, self._set_profile_speed_label, key, label)
+            self.after(0, self.log, "Speedtest завершён")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_profile_speed_label(self, key: str, label: str) -> None:
+        # Reuse the ping column to show the speed (we keep ping cache separate).
+        if self.profile_list is None:
+            return
+        for index, profile in enumerate(self.profiles):
+            if self._profile_ping_key(profile) == key:
+                try:
+                    self.profile_list.set(str(index), "ping", label)
+                except Exception:
+                    pass
+                return
+
+    def export_profiles(self) -> None:
+        if not self.profiles:
+            self._show_toast("MeDVeD", "Нет профилей для экспорта.", "info")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Экспортировать профили",
+            defaultextension=".json",
+            initialfile=f"medved_profiles_{time.strftime('%Y%m%d')}.json",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            payload = {
+                "app": "MeDVeD",
+                "version": __version__,
+                "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "profiles": [p.to_dict() for p in self.profiles],
+                "subscriptions": list(self.settings.subscriptions),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            self._show_snackbar(f"Экспортировано {len(self.profiles)} профилей", "ok")
+        except Exception as error:
+            self._show_toast("MeDVeD", f"Не удалось экспортировать: {error}", "error")
+
+    def import_profiles_from_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Импорт профилей из файла",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as error:
+            self._show_toast("MeDVeD", f"Не удалось прочитать файл: {error}", "error")
+            return
+        raw_profiles = data.get("profiles") if isinstance(data, dict) else data
+        if not isinstance(raw_profiles, list):
+            self._show_toast("MeDVeD", "Неверный формат файла.", "error")
+            return
+        imported = [VlessProfile.from_dict(p) for p in raw_profiles if isinstance(p, dict)]
+        if not imported:
+            self._show_toast("MeDVeD", "В файле нет валидных профилей.", "info")
+            return
+        before = len(self.profiles)
+        self._append_profiles(imported)
+        # Also pull subscriptions if present and not already known
+        if isinstance(data, dict):
+            for sub in (data.get("subscriptions") or []):
+                if isinstance(sub, str) and sub and sub not in self.settings.subscriptions:
+                    self.settings.subscriptions.append(sub)
+            save_settings(self.settings)
+        added = len(self.profiles) - before
+        self._show_snackbar(f"Импортировано: +{added} (из {len(imported)})", "ok")
 
     def _set_profile_ping(self, key: str, ping_ms: Optional[float]) -> None:
         self._profile_pings[key] = ping_ms
@@ -2363,9 +2949,12 @@ def main() -> None:
     if not _acquire_single_instance_lock():
         _activate_existing_window("MeDVeD")
         sys.exit(0)
-    ctk.set_appearance_mode("dark")
+    settings = load_settings()
+    ctk.set_appearance_mode(settings.appearance_mode if settings.appearance_mode in ("dark", "light", "system") else "dark")
     ctk.set_default_color_theme("blue")
     app = VlessApp()
+    if "--minimized" in sys.argv[1:] or settings.start_minimized:
+        app.after(100, app.withdraw)
     app.mainloop()
 
 

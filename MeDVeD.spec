@@ -8,7 +8,7 @@ hiddenimports = []
 hiddenimports += collect_submodules('plyer')
 hiddenimports += collect_submodules('plyer.platforms')
 hiddenimports += collect_submodules('pystray')
-hiddenimports += ['PIL.Image', 'PIL.ImageDraw']
+hiddenimports += ['PIL.Image', 'PIL.ImageDraw', 'yaml']
 
 
 datas += [
