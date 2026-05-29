@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MeDVeD-specific overrides
+!MeDVeD.spec
+sing-box.exe
+_test_*.json
+.sixth/
+memory/
+
