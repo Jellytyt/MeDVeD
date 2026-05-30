@@ -38,7 +38,7 @@ from parser import parse_link, profile_to_vless_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -2922,22 +2922,57 @@ class VlessApp(ctk.CTk):
         except Exception as error:
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось скачать: {e}", "error"))
             return
-        # Wait for our PID to exit, then replace and relaunch via PowerShell.
-        ps_cmd = (
-            f"$ErrorActionPreference='SilentlyContinue';"
-            f"try{{(Get-Process -Id {os.getpid()}).WaitForExit(30000)}}catch{{}};"
-            f"Start-Sleep -Milliseconds 500;"
-            f"Move-Item -Force -Path '{new_exe}' -Destination '{target_exe}';"
-            f"Start-Process -FilePath '{target_exe}'"
+
+        # Write a real .ps1 file + run it with -File. Single-line -Command was
+        # flaky under DETACHED_PROCESS (script would silently skip Move-Item).
+        # Each step writes to %TEMP%\MeDVeD_updater.log so we can debug failures.
+        log_path = tmp_dir / "MeDVeD_updater.log"
+        ps_file = tmp_dir / f"MeDVeD_updater_{os.getpid()}.ps1"
+        ps_script = (
+            f"$ErrorActionPreference = 'SilentlyContinue'\n"
+            f"$logPath = '{log_path}'\n"
+            f"\"=== updater start $(Get-Date) ===\" | Out-File -FilePath $logPath -Append\n"
+            f"\"Waiting for PID {os.getpid()} to exit...\" | Out-File -FilePath $logPath -Append\n"
+            f"try {{\n"
+            f"    $proc = Get-Process -Id {os.getpid()} -ErrorAction Stop\n"
+            f"    $proc.WaitForExit(30000) | Out-Null\n"
+            f"    \"PID exited cleanly\" | Out-File -FilePath $logPath -Append\n"
+            f"}} catch {{\n"
+            f"    \"PID already gone (ok): $_\" | Out-File -FilePath $logPath -Append\n"
+            f"}}\n"
+            f"Start-Sleep -Milliseconds 800\n"
+            f"try {{\n"
+            f"    Move-Item -Force -Path '{new_exe}' -Destination '{target_exe}' -ErrorAction Stop\n"
+            f"    \"Move OK -> {target_exe}\" | Out-File -FilePath $logPath -Append\n"
+            f"}} catch {{\n"
+            f"    \"Move FAILED: $_\" | Out-File -FilePath $logPath -Append\n"
+            f"    exit 1\n"
+            f"}}\n"
+            f"try {{\n"
+            f"    Start-Process -FilePath '{target_exe}'\n"
+            f"    \"Start-Process OK\" | Out-File -FilePath $logPath -Append\n"
+            f"}} catch {{\n"
+            f"    \"Start FAILED: $_\" | Out-File -FilePath $logPath -Append\n"
+            f"}}\n"
         )
         try:
+            ps_file.write_text(ps_script, encoding="utf-8-sig")
+        except Exception as error:
+            self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось подготовить установщик: {e}", "error"))
+            return
+
+        try:
             DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
             subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive",
                  "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
-                 "-Command", ps_cmd],
-                creationflags=subprocess.CREATE_NO_WINDOW | DETACHED_PROCESS,
+                 "-File", str(ps_file)],
+                creationflags=subprocess.CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
                 close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except Exception as error:
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось запустить установщик: {e}", "error"))
