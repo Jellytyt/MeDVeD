@@ -459,6 +459,7 @@ class VlessApp(ctk.CTk):
         self._ul_history: deque = deque(maxlen=60)
         self._pending_profiles: List[VlessProfile] = []
         self._is_urltest = False
+        self._settings_ui_ready = False
         self._update_available = False
         self._update_version = ""
         self._update_url = ""
@@ -1733,24 +1734,29 @@ class VlessApp(ctk.CTk):
 
             time.sleep(1)
 
-    def save_app_settings(self) -> None:
+    def _apply_settings_now(self, *_args: Any) -> None:
+        """Apply every settings UI value to self.settings and persist immediately.
+        Called automatically on every toggle/dropdown/field change — there is no
+        manual Save button. The *_args tail lets it be used as a trace_add callback."""
+        if not getattr(self, "_settings_ui_ready", False):
+            return
         path = self.settings_path_var.get().strip()
-        warnings = []
 
         resolved = self._find_sing_box_path(path)
         if resolved is not None:
             self.settings.sing_box_path = str(resolved)
-            self.settings_path_var.set(str(resolved))
-        elif path:
-            warnings.append(f"Путь к sing-box не найден: {path}")
+            if str(resolved) != self.settings_path_var.get():
+                # Avoid trace recursion: only update var if path actually changed.
+                self.settings_path_var.set(str(resolved))
 
+        prev_auto_connect = self.settings.auto_connect_enabled
         self.settings.auto_connect_enabled = bool(self.auto_connect_var.get())
-        if self.settings.auto_connect_enabled:
+        if self.settings.auto_connect_enabled and not prev_auto_connect:
             selected = self._selected_single_profile()
             if selected is not None:
                 self.settings.auto_connect_key = self._profile_ping_key(selected)
             elif not self.settings.auto_connect_key:
-                warnings.append("Автоподключение включено, но профиль не выбран — выберите профиль (один клик в списке) и сохраните ещё раз")
+                self.log("⚠ Автоподключение включено, но профиль не выбран — выберите профиль и снова включите")
 
         self.settings.notifications_enabled = bool(self.notifications_var.get())
         self.settings.bypass_ru = bool(self.bypass_ru_var.get())
@@ -1768,13 +1774,16 @@ class VlessApp(ctk.CTk):
         if new_language in ("ru", "en") and new_language != self.settings.language:
             self.settings.language = new_language
             self._show_snackbar(_t_for(new_language, "lang_change_restart"), "info", duration_ms=5000)
+        prev_autostart = self.settings.auto_start_with_windows
+        prev_min = self.settings.start_minimized
         self.settings.auto_start_with_windows = bool(self.autostart_var.get())
         self.settings.start_minimized = bool(self.start_minimized_var.get())
-        autostart_error = _set_autostart(
-            self.settings.auto_start_with_windows, self.settings.start_minimized,
-        )
-        if autostart_error:
-            warnings.append(f"Автозапуск: {autostart_error}")
+        if (self.settings.auto_start_with_windows != prev_autostart) or (self.settings.start_minimized != prev_min):
+            autostart_error = _set_autostart(
+                self.settings.auto_start_with_windows, self.settings.start_minimized,
+            )
+            if autostart_error:
+                self._show_snackbar(f"Автозапуск: {autostart_error}", "warn", duration_ms=4000)
         was_kill_switch = self.settings.kill_switch
         self.settings.kill_switch = bool(self.kill_switch_var.get())
         if was_kill_switch and not self.settings.kill_switch:
@@ -1782,14 +1791,15 @@ class VlessApp(ctk.CTk):
         try:
             self.settings.subscription_refresh_hours = max(0, int(self.subscription_refresh_var.get() or 0))
         except ValueError:
-            warnings.append("Интервал авто-обновления должен быть числом — оставлено прежнее значение")
+            pass
 
-        save_settings(self.settings)
+        try:
+            save_settings(self.settings)
+        except Exception as error:
+            self.log(f"⚠ Не удалось сохранить настройки: {error}")
+            return
         self._schedule_subscription_refresh()
         self._refresh_server_menu()
-        self.log("Настройки сохранены" + (f" (предупреждения: {len(warnings)})" if warnings else ""))
-        for warning in warnings:
-            self.log("  ⚠ " + warning)
 
     def _find_sing_box_path(self, hint: str = "") -> Optional[Path]:
         candidates: list[Path] = []
@@ -2230,7 +2240,10 @@ class VlessApp(ctk.CTk):
         proc_buttons.pack(side=RIGHT, fill=Y, padx=(8, 0))
 
         def add_rule() -> None:
-            self._prompt_process_rule(on_done=reload_proc_tree)
+            def done() -> None:
+                reload_proc_tree()
+                self._apply_settings_now()
+            self._prompt_process_rule(on_done=done)
 
         def remove_rule() -> None:
             selection = proc_tree.selection()
@@ -2243,6 +2256,7 @@ class VlessApp(ctk.CTk):
             if 0 <= index < len(self.settings.process_rules):
                 self.settings.process_rules.pop(index)
                 reload_proc_tree()
+                self._apply_settings_now()
 
         ctk.CTkButton(proc_buttons, text="+ Добавить", command=add_rule, width=110, height=30).pack(pady=(0, 6))
         ctk.CTkButton(proc_buttons, text="− Удалить", command=remove_rule, width=110, height=30, fg_color="#7a3a3a").pack()
@@ -2285,7 +2299,10 @@ class VlessApp(ctk.CTk):
         route_buttons.pack(side=RIGHT, fill=Y, padx=(8, 0))
 
         def add_route_rule() -> None:
-            self._prompt_routing_rule(on_done=reload_route_tree)
+            def done() -> None:
+                reload_route_tree()
+                self._apply_settings_now()
+            self._prompt_routing_rule(on_done=done)
 
         def remove_route_rule() -> None:
             selection = route_tree.selection()
@@ -2298,17 +2315,41 @@ class VlessApp(ctk.CTk):
             if 0 <= index < len(self.settings.routing_rules):
                 self.settings.routing_rules.pop(index)
                 reload_route_tree()
+                self._apply_settings_now()
 
         ctk.CTkButton(route_buttons, text="+ Добавить", command=add_route_rule, width=110, height=30).pack(pady=(0, 6))
         ctk.CTkButton(route_buttons, text="− Удалить", command=remove_route_rule, width=110, height=30, fg_color="#7a3a3a").pack()
 
-        # ---------- Bottom button bar (Save / Check updates) ----------
-        ctk.CTkButton(bottom, text="Сохранить", command=self.save_app_settings, height=34).pack(side=RIGHT)
+        # ---------- Bottom button bar (Check updates only — settings auto-save) ----------
         ctk.CTkButton(
             bottom, text=f"Проверить обновления  (v{__version__})",
             command=self._manual_check_for_update, height=34,
             fg_color="#3a3a3a", hover_color="#4a4a4a",
         ).pack(side=LEFT)
+
+        # ---------- Wire up auto-save on every change ----------
+        # Each toggle/dropdown/spinbox change calls _apply_settings_now immediately.
+        # The Entry field for sing-box path uses FocusOut so we don't write on
+        # every keystroke. process_rules / routing_rules are saved by the
+        # reload_*_tree closures (they call _apply_settings_now after add/remove).
+        for var in (
+            self.auto_connect_var,
+            self.autostart_var,
+            self.start_minimized_var,
+            self.notifications_var,
+            self.bypass_ru_var,
+            self.kill_switch_var,
+            self.urltest_auto_switch_var,
+            self.appearance_var,
+            self.language_var,
+            self.subscription_refresh_var,
+        ):
+            var.trace_add("write", self._apply_settings_now)
+        self.singbox_entry.bind("<FocusOut>", lambda _e: self._apply_settings_now())
+
+        self._proc_rules_reload = reload_proc_tree
+        self._route_rules_reload = reload_route_tree
+        self._settings_ui_ready = True
 
         self._views["settings"] = view
 
