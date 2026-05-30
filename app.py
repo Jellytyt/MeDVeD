@@ -38,7 +38,7 @@ from parser import parse_link, profile_to_vless_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -2953,9 +2953,10 @@ class VlessApp(ctk.CTk):
         threading.Thread(target=self._download_and_apply_update, daemon=True).start()
 
     def _download_and_apply_update(self) -> None:
-        target_exe = Path(sys.executable).resolve()
         tmp_dir = Path(tempfile.gettempdir())
+        target_exe = Path(sys.executable).resolve()
         new_exe = tmp_dir / f"MeDVeD_new_{os.getpid()}.exe"
+
         try:
             req = urllib.request.Request(self._update_url, headers={"User-Agent": f"MeDVeD/{__version__}"})
             with urllib.request.urlopen(req, timeout=180) as resp, new_exe.open("wb") as out:
@@ -2966,7 +2967,7 @@ class VlessApp(ctk.CTk):
 
         # Write a real .ps1 file + run it with -File. Single-line -Command was
         # flaky under DETACHED_PROCESS (script would silently skip Move-Item).
-        # Each step writes to %TEMP%\MeDVeD_updater.log so we can debug failures.
+        # Each step also writes to %TEMP%\MeDVeD_updater.log via PowerShell.
         log_path = tmp_dir / "MeDVeD_updater.log"
         ps_file = tmp_dir / f"MeDVeD_updater_{os.getpid()}.ps1"
         ps_script = (
@@ -3003,22 +3004,24 @@ class VlessApp(ctk.CTk):
             return
 
         try:
-            DETACHED_PROCESS = 0x00000008
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            # Just CREATE_NO_WINDOW — DETACHED_PROCESS combined with redirected
+            # DEVNULL pipes silently breaks powershell.exe in some PyInstaller
+            # frozen-exe scenarios (the helper PID returns, but the script body
+            # never runs). On a GUI app the child outlives the parent anyway.
             subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-NonInteractive",
                  "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass",
                  "-File", str(ps_file)],
-                creationflags=subprocess.CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                close_fds=False,
             )
         except Exception as error:
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось запустить установщик: {e}", "error"))
             return
-        self.after(500, self._real_quit)
+
+        # Give the OS time to actually create the PowerShell process before we
+        # tear our own window down. 500ms was sometimes not enough on cold systems.
+        self.after(2000, self._real_quit)
 
 
 def main() -> None:
