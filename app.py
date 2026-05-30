@@ -38,7 +38,7 @@ from parser import parse_link, profile_to_vless_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -291,6 +291,89 @@ def _activate_existing_window(title: str) -> bool:
         return False
 
 
+_LOG_FILE_NAME = "app.log"
+_LOG_MAX_BYTES = 1024 * 1024  # 1 MB before rotation
+
+
+def _get_log_file_path() -> Path:
+    """Persistent log lives next to the user's profiles/settings, NOT inside
+    the exe folder — that one might be Program Files (read-only) and would also
+    be wiped by our own auto-update Move-Item."""
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or str(Path.home())
+        return Path(base) / "vless_manager" / _LOG_FILE_NAME
+    return Path.home() / ".vless_manager" / _LOG_FILE_NAME
+
+
+def _write_log_line(line: str) -> None:
+    """Append a single line to the persistent log, with size-based rotation.
+    Silent on failure — logging itself must never crash the app."""
+    try:
+        path = _get_log_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
+            backup = path.with_suffix(path.suffix + ".1")
+            try:
+                if backup.exists():
+                    backup.unlink()
+                path.rename(backup)
+            except Exception:
+                pass
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+            if not line.endswith("\n"):
+                f.write("\n")
+    except Exception:
+        pass
+
+
+def _cleanup_stale_tun_adapters() -> None:
+    """sing-box can leave behind 'singtunN' adapters if it was force-killed.
+    On next start that can cause 'Cannot create a file when that file already
+    exists'. We try to delete every adapter whose name starts with 'singtun'.
+    Runs once at startup, silent on failure (best-effort cleanup)."""
+    if os.name != "nt":
+        return
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(
+            ["netsh", "interface", "show", "interface"],
+            capture_output=True, text=True, timeout=5,
+            encoding="cp866", errors="replace",
+            creationflags=creationflags,
+        )
+        if result.returncode != 0:
+            return
+        for line in result.stdout.splitlines():
+            tokens = line.strip().split()
+            if not tokens:
+                continue
+            name = tokens[-1]
+            if name.lower().startswith("singtun"):
+                subprocess.run(
+                    ["netsh", "interface", "set", "interface", f"name={name}", "admin=disable"],
+                    capture_output=True, timeout=3,
+                    creationflags=creationflags,
+                )
+    except Exception:
+        pass
+
+
+def _install_global_excepthooks() -> None:
+    """Route every uncaught exception (main thread + worker threads) into the
+    persistent log. Without this, a frozen GUI exe just silently disappears."""
+    import traceback
+
+    def _hook(exc_type, exc_value, exc_tb):
+        msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        _write_log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] UNCAUGHT:\n{msg}")
+
+    sys.excepthook = lambda et, ev, tb: _hook(et, ev, tb)
+    # threading.excepthook landed in 3.8 — guard just in case.
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = lambda args: _hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+
 _AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_VALUE_NAME = "MeDVeD"
 
@@ -459,6 +542,7 @@ class VlessApp(ctk.CTk):
         self._ul_history: deque = deque(maxlen=60)
         self._pending_profiles: List[VlessProfile] = []
         self._is_urltest = False
+        self._self_heal_attempted = False
         self._settings_ui_ready = False
         self._update_available = False
         self._update_version = ""
@@ -902,6 +986,7 @@ class VlessApp(ctk.CTk):
 
     def log(self, message: str) -> None:
         self._log_buffer.append(message)
+        _write_log_line(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
         if self.log_widget is not None:
             try:
                 self.log_widget.configure(state="normal")
@@ -1100,7 +1185,10 @@ class VlessApp(ctk.CTk):
                     payload = response.read().decode("utf-8", errors="ignore")
                     sub_info_header = response.headers.get("subscription-userinfo") or response.headers.get("Subscription-Userinfo")
                     if sub_info_header:
+                        self.after(0, self.log, f"Подписка прислала лимиты: {sub_info_header}")
                         self._save_subscription_info(url, sub_info_header)
+                    else:
+                        self.after(0, self.log, "Подписка не сообщила лимиты (нет заголовка subscription-userinfo)")
             except Exception as error:
                 last_error = f"{type(error).__name__}: {error}"
                 continue
@@ -1178,7 +1266,12 @@ class VlessApp(ctk.CTk):
             if ex > 0 and (earliest_expire is None or ex < earliest_expire):
                 earliest_expire = ex
         if total <= 0 and earliest_expire is None:
-            label.configure(text="")
+            # Show a placeholder so the user knows the feature exists and that
+            # their provider just isn't sharing the limits header.
+            if self.settings.subscriptions:
+                label.configure(text="(подписка не сообщает лимиты)")
+            else:
+                label.configure(text="")
             return
         parts = []
         if total > 0:
@@ -1450,7 +1543,32 @@ class VlessApp(ctk.CTk):
             self._is_urltest = False
         self._pending_active_name = active_name
         self.log(f"Конфиг готов, API порт: {self._api_port}")
+        self._self_heal_attempted = False
         self._start_sing_box(config_data)
+
+    def _sing_box_preflight(self, sing_box_executable: Path, config_path: Path) -> Optional[str]:
+        """Run `sing-box check` and return None on success, or a short error
+        string describing the validation failure. Catches malformed configs
+        before they show up as a confusing 'код 1' crash post-run."""
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            result = subprocess.run(
+                [str(sing_box_executable), "check", "-c", str(config_path)],
+                capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace",
+                creationflags=creationflags,
+            )
+        except subprocess.TimeoutExpired:
+            return "sing-box check завис (>10с)"
+        except Exception as error:
+            return f"{type(error).__name__}: {error}"
+        if result.returncode == 0:
+            return None
+        msg = (result.stderr or result.stdout or "").strip()
+        if not msg:
+            msg = f"check вернул код {result.returncode}"
+        # sing-box prints the file path noise; trim it.
+        return msg.split("\n")[-1][:300]
 
     def _start_sing_box(self, config_data: dict) -> None:
         self.disconnect()
@@ -1469,6 +1587,17 @@ class VlessApp(ctk.CTk):
                 self.after(0, self.log, "Поиск sing-box...")
                 sing_box_executable = self._ensure_sing_box_binary()
                 self.after(0, self.log, f"sing-box: {sing_box_executable}")
+
+                # Preflight: run `sing-box check` first so a malformed config
+                # surfaces an actionable error instead of "VPN упал код 1".
+                check_result = self._sing_box_preflight(sing_box_executable, config_path)
+                if check_result is not None:
+                    self.after(0, self.log, f"❌ Конфиг невалиден: {check_result}")
+                    self.after(0, lambda msg=check_result: self._show_toast(
+                        "Ошибка конфига sing-box", msg, "error"
+                    ))
+                    return
+
                 command = [str(sing_box_executable), "run", "-c", str(config_path)]
                 creationflags = 0
                 if os.name == "nt":
@@ -1486,6 +1615,7 @@ class VlessApp(ctk.CTk):
                 setattr(new_process, "_mvd_user_disconnect", False)
                 with self._process_lock:
                     self.process = new_process
+                start_time = time.monotonic()
                 self.after(0, self._update_active_state, True)
                 self.after(0, self.log, f"Процесс запущен, PID={new_process.pid}")
                 if self._api_port is not None:
@@ -1502,13 +1632,24 @@ class VlessApp(ctk.CTk):
                 )
                 if crashed:
                     self.after(0, self._notify, "MeDVeD", f"VPN упал (код {new_process.returncode})")
-                    if self.settings.kill_switch:
+                    # Self-heal: if the crash happened after a healthy uptime,
+                    # try ONE auto-reconnect to the same config. Don't loop on
+                    # rapid crashes (would just thrash on a permanent error).
+                    uptime = time.monotonic() - start_time
+                    if uptime >= 10 and not self._self_heal_attempted:
+                        self._self_heal_attempted = True
+                        self.after(0, self.log, f"Сам-восстановление: переподключаюсь через 3 сек (uptime={int(uptime)}с)")
+                        self.after(3000, lambda: self._start_sing_box(config_data))
+                    elif self.settings.kill_switch:
                         err = _kill_switch_engage()
                         if err:
                             self.after(0, self.log, f"Kill switch: не удалось включить — {err}")
                         else:
                             self.after(0, self.log, "Kill switch активирован — интернет заблокирован до переподключения")
                             self.after(0, self._notify, "MeDVeD", "Kill switch активирован")
+                else:
+                    # Clean exit (user disconnect or own quit) — reset self-heal counter.
+                    self._self_heal_attempted = False
             except FileNotFoundError as error:
                 self.after(0, lambda e=error: self._show_toast("MeDVeD", str(e), "error"))
                 self.after(0, self.log, f"FileNotFoundError: {error}")
@@ -3025,9 +3166,12 @@ class VlessApp(ctk.CTk):
 
 
 def main() -> None:
+    _install_global_excepthooks()
+    _write_log_line(f"=== MeDVeD v{__version__} starting (frozen={getattr(sys,'frozen',False)}) ===")
     if not _acquire_single_instance_lock():
         _activate_existing_window("MeDVeD")
         sys.exit(0)
+    _cleanup_stale_tun_adapters()
     settings = load_settings()
     ctk.set_appearance_mode(settings.appearance_mode if settings.appearance_mode in ("dark", "light", "system") else "dark")
     ctk.set_default_color_theme("blue")

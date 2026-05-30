@@ -1,0 +1,64 @@
+name: Build & Release
+
+# Триггер: push любого тега вида v0.9.4, v1.0.0 и т.д.
+# Шаги: установить Python и зависимости, скачать sing-box.exe,
+# собрать MeDVeD.exe через PyInstaller, прикрепить к Release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # нужно для создания GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Download sing-box.exe (latest stable for windows-amd64)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/latest" -Headers @{ "User-Agent" = "MeDVeD-CI" }
+          $asset = $release.assets | Where-Object { $_.name -match "windows-amd64.*\.zip$" } | Select-Object -First 1
+          if (-not $asset) { throw "No windows-amd64 zip found in sing-box latest release" }
+          Write-Output "Downloading $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile sing-box.zip
+          Expand-Archive sing-box.zip -DestinationPath sing-box-extract
+          $exePath = Get-ChildItem -Path sing-box-extract -Recurse -Filter "sing-box.exe" | Select-Object -First 1
+          if (-not $exePath) { throw "sing-box.exe not found in archive" }
+          Copy-Item $exePath.FullName -Destination .\sing-box.exe -Force
+          Write-Output "sing-box.exe size: $((Get-Item sing-box.exe).Length) bytes"
+
+      - name: Build MeDVeD.exe
+        run: pyinstaller --noconfirm MeDVeD.spec
+
+      - name: Verify build
+        shell: powershell
+        run: |
+          $exe = Get-Item dist\MeDVeD.exe
+          Write-Output "Built MeDVeD.exe: $([math]::Round($exe.Length/1MB,2)) MB"
+          if ($exe.Length -lt 20MB) { throw "exe too small — build looks broken" }
+
+      - name: Create GitHub Release with attached exe
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MeDVeD.exe
+          # Если Release под этот тег ещё не создан вручную — Actions создаст его.
+          # Если уже создан — добавит exe как ассет.
+          fail_on_unmatched_files: true
+          generate_release_notes: false
