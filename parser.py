@@ -303,9 +303,113 @@ def parse_tuic_link(link: str, default_name: str = "Imported TUIC", source_url: 
     )
 
 
+def profile_to_link(profile: VlessProfile) -> str:
+    """Export a profile back to its native share-link, dispatching by protocol.
+    Previously the 'Copy link' button always called profile_to_vless_link, which
+    silently produced a broken 'vless://@host:port?...' (empty UUID) for trojan /
+    ss / hysteria2 / tuic profiles. Each branch below round-trips with the
+    matching parse_* function so the copied link re-imports cleanly."""
+    proto = (profile.protocol or "vless").lower()
+    if proto == "vless":
+        return profile_to_vless_link(profile)
+    if proto == "vmess":
+        return _profile_to_vmess_link(profile)
+    if proto == "trojan":
+        return _profile_to_trojan_link(profile)
+    if proto == "shadowsocks":
+        return _profile_to_ss_link(profile)
+    if proto == "hysteria2":
+        return _profile_to_hysteria2_link(profile)
+    if proto == "tuic":
+        return _profile_to_tuic_link(profile)
+    raise ValueError(f"Экспорт ссылки не поддерживается для протокола {profile.protocol!r}")
+
+
+def _build_query(items: Dict[str, str]) -> str:
+    return "&".join(
+        f"{key}={quote(str(value), safe='')}"
+        for key, value in items.items()
+        if value not in ("", None)
+    )
+
+
+def _profile_to_vmess_link(profile: VlessProfile) -> str:
+    data = {
+        "v": "2",
+        "ps": profile.remark or profile.name,
+        "add": profile.server,
+        "port": str(profile.port),
+        "id": profile.uuid,
+        "aid": str(profile.alter_id or 0),
+        "net": profile.type or "tcp",
+        "type": "none",
+        "host": profile.host,
+        "path": profile.path,
+        "tls": profile.security if profile.security in ("tls", "reality") else "",
+        "sni": profile.sni,
+        "alpn": profile.alpn,
+        "fp": profile.fp,
+    }
+    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+    return "vmess://" + encoded
+
+
+def _profile_to_trojan_link(profile: VlessProfile) -> str:
+    query = _build_query({
+        "security": profile.security or "tls",
+        "type": profile.type or "tcp",
+        "sni": profile.sni,
+        "fp": profile.fp,
+        "host": profile.host,
+        "path": profile.path,
+        "serviceName": profile.service_name,
+        "alpn": profile.alpn,
+        "allowInsecure": "1" if profile.insecure else "",
+    })
+    name = quote(profile.remark or profile.name, safe="")
+    auth = quote(profile.password, safe="")
+    return f"trojan://{auth}@{profile.server}:{profile.port}?{query}#{name}"
+
+
+def _profile_to_ss_link(profile: VlessProfile) -> str:
+    userinfo = base64.b64encode(
+        f"{profile.method}:{profile.password}".encode("utf-8")
+    ).decode("ascii")
+    name = quote(profile.remark or profile.name, safe="")
+    return f"ss://{userinfo}@{profile.server}:{profile.port}#{name}"
+
+
+def _profile_to_hysteria2_link(profile: VlessProfile) -> str:
+    query = _build_query({
+        "sni": profile.sni,
+        "alpn": profile.alpn,
+        "insecure": "1" if profile.insecure else "",
+        "obfs": profile.obfs,
+        "obfs-password": profile.obfs_password,
+    })
+    name = quote(profile.remark or profile.name, safe="")
+    auth = quote(profile.password, safe="")
+    base = f"hysteria2://{auth}@{profile.server}:{profile.port}"
+    return f"{base}?{query}#{name}" if query else f"{base}#{name}"
+
+
+def _profile_to_tuic_link(profile: VlessProfile) -> str:
+    query = _build_query({
+        "sni": profile.sni,
+        "alpn": profile.alpn,
+        "congestion_control": profile.congestion_control or "bbr",
+        "udp_relay_mode": profile.udp_relay_mode or "native",
+        "allow_insecure": "1" if profile.insecure else "",
+    })
+    name = quote(profile.remark or profile.name, safe="")
+    userinfo = f"{quote(profile.uuid, safe='')}:{quote(profile.password, safe='')}"
+    return f"tuic://{userinfo}@{profile.server}:{profile.port}?{query}#{name}"
+
+
 def profile_to_vless_link(profile: VlessProfile) -> str:
-    """Export VLESS profile back to vless:// link. Only used for the
-    'Copy link' button — multi-protocol export is not implemented yet."""
+    """Export VLESS profile back to vless:// link. Used by profile_to_link for
+    the vless branch and kept public for backward compatibility."""
     query_items = {
         "encryption": "none",
         "security": profile.security,

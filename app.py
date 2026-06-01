@@ -27,18 +27,13 @@ from typing import Any, Dict, List, Optional
 import pystray
 from PIL import Image, ImageDraw
 
-try:
-    from plyer import notification as plyer_notification
-except ImportError:
-    plyer_notification = None
-
 from config import build_sing_box_config
 from models import VlessProfile
-from parser import parse_link, profile_to_vless_link
+from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -57,7 +52,6 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "delete": "Удалить",
         "import": "Импорт",
         "export": "Экспорт",
-        "speedtest": "Speedtest",
         "check_pings": "Проверить пинги",
         "copy_link": "Скопировать ссылку",
         "no_profiles_title": "Нет профилей",
@@ -85,7 +79,6 @@ _TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "delete": "Delete",
         "import": "Import",
         "export": "Export",
-        "speedtest": "Speedtest",
         "check_pings": "Test pings",
         "copy_link": "Copy link",
         "no_profiles_title": "No profiles",
@@ -220,6 +213,35 @@ def _kill_switch_release() -> None:
         pass
 
 
+def _cleanup_stale_kill_switch() -> None:
+    """A kill-switch firewall rule blocks almost all outbound traffic and
+    PERSISTS across reboots. If the GUI process died hard (crash / Task Manager /
+    power loss / BSOD) while the rule was active, the user is left with no
+    internet and no idea why. At startup the previous instance is guaranteed
+    gone (single-instance mutex), so any lingering MeDVeD-KillSwitch rule is
+    necessarily stale — drop it. Logs only when a rule actually existed, so the
+    journal explains why the internet came back."""
+    if os.name != "nt":
+        return
+    try:
+        check = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={_KILL_SWITCH_RULE_NAME}"],
+            capture_output=True, text=True, timeout=5,
+            encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if check.returncode == 0:
+            _kill_switch_release()
+            _write_log_line(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Removed stale kill-switch "
+                f"firewall rule left over from a previous hard exit"
+            )
+    except Exception:
+        # If the existence check itself failed, attempt a blind release anyway —
+        # deleting a non-existent rule is harmless.
+        _kill_switch_release()
+
+
 def _get_hwid() -> str:
     """Read Windows MachineGuid (used by many providers as device fingerprint
     via X-Hwid header — e.g. Karing/Happ-style subscriptions)."""
@@ -246,6 +268,54 @@ def _tcp_ping(host: str, port: int, timeout: float = 3.0) -> Optional[float]:
             return (time.perf_counter() - start) * 1000.0
     except (OSError, socket.timeout):
         return None
+
+
+def _tls_ping(host: str, port: int, server_name: str = "", timeout: float = 5.0) -> Optional[float]:
+    """One full TCP+TLS handshake, returns elapsed ms. This is the same kind
+    of measurement Karing/clients show as 'ping' — it captures the real cost
+    of opening a working connection to the VLESS endpoint (sub-1ms results
+    from raw TCP ping are misleading because they skip the TLS roundtrip)."""
+    if not host or port <= 0:
+        return None
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        start = time.perf_counter()
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=server_name or host) as ssock:
+                ssock.do_handshake()
+                return (time.perf_counter() - start) * 1000.0
+    except (OSError, socket.timeout, ssl.SSLError):
+        return None
+
+
+def _ping_avg(host: str, port: int, server_name: str = "", attempts: int = 3, pause: float = 0.2) -> Optional[float]:
+    """Preferred ping: TCP+TLS handshake time, averaged across several attempts
+    with the slowest outlier dropped. This matches what clients like Karing
+    show as the server's 'ping' — a realistic 50–200ms range for normal
+    overseas servers, not the unrealistic sub-1ms numbers a raw TCP-only or
+    ICMP probe can produce. Falls back to plain TCP if TLS handshake fails
+    (server may not be TLS or may reject our handshake)."""
+    samples: List[float] = []
+    for i in range(attempts):
+        value = _tls_ping(host, port, server_name)
+        if value is None:
+            value = _tcp_ping(host, port)
+        if value is not None:
+            samples.append(value)
+        if i < attempts - 1:
+            time.sleep(pause)
+    if not samples:
+        return None
+    samples.sort()
+    if len(samples) >= 3:
+        samples = samples[:-1]  # drop slowest outlier
+    mid = len(samples) // 2
+    if len(samples) % 2 == 1:
+        return samples[mid]
+    return (samples[mid - 1] + samples[mid]) / 2.0
 
 
 _SINGLE_INSTANCE_MUTEX_NAME = "MeDVeD-VPN-SingleInstance"
@@ -376,29 +446,73 @@ def _install_global_excepthooks() -> None:
 
 _AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_VALUE_NAME = "MeDVeD"
+_AUTOSTART_TASK_NAME = "MeDVeD-Autostart"
 
 
-def _set_autostart(enabled: bool, start_minimized: bool) -> Optional[str]:
-    """Toggle 'launch on Windows boot' via HKCU\\...\\Run. Returns error or None."""
+def _remove_run_key_autostart() -> None:
+    """Delete the legacy HKCU\\...\\Run autostart value if present. Older builds
+    started the app via the Run key (non-elevated); we've moved to an elevated
+    scheduled task. Best-effort, silent on failure."""
     if os.name != "nt":
-        return "Только Windows"
-    if not getattr(sys, "frozen", False):
-        # In dev mode there's no exe to autostart — skip silently.
-        return None
+        return
     try:
         import winreg
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE,
         ) as key:
-            if enabled:
-                exe = str(Path(sys.executable).resolve())
-                cmd = f'"{exe}" --minimized' if start_minimized else f'"{exe}"'
-                winreg.SetValueEx(key, _AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, cmd)
-            else:
-                try:
-                    winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
-                except FileNotFoundError:
-                    pass
+            try:
+                winreg.DeleteValue(key, _AUTOSTART_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+
+
+def _set_autostart(enabled: bool, start_minimized: bool) -> Optional[str]:
+    """Toggle 'launch on Windows logon' via a Scheduled Task running with HIGHEST
+    privileges (elevated). The HKCU\\...\\Run key can only launch non-elevated,
+    which means TUN-mode auto-connect would hit a UAC / admin prompt on every
+    boot; a highest-privileges scheduled task starts MeDVeD already-elevated at
+    logon with no prompt at all. Creating or deleting such a task itself needs
+    admin rights, so we ask the user to relaunch elevated when we don't have
+    them. Returns an error string, or None on success."""
+    if os.name != "nt":
+        return "Только Windows"
+    if not getattr(sys, "frozen", False):
+        # In dev mode there's no exe to autostart — skip silently.
+        return None
+    if not _is_admin():
+        return ("Нужны права администратора, чтобы настроить автозапуск с "
+                "правами. Перезапустите MeDVeD от имени администратора и снова "
+                "включите автозапуск.")
+    exe = str(Path(sys.executable).resolve())
+    try:
+        if enabled:
+            # /TR keeps the exe path quoted (it may live in Program Files); the
+            # "\"path\" args" form is the reliable way to pass spaces + args to
+            # schtasks. /SC ONLOGON = at logon, /RL HIGHEST = elevated (this is
+            # what bypasses UAC at boot), /F = overwrite existing task silently.
+            tr = f'"{exe}"' + (" --minimized" if start_minimized else "")
+            result = subprocess.run(
+                ["schtasks", "/Create", "/TN", _AUTOSTART_TASK_NAME,
+                 "/TR", tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0:
+                msg = (result.stderr or result.stdout or "").strip()
+                return msg or f"schtasks /Create вернул код {result.returncode}"
+            _remove_run_key_autostart()  # migrate away from the old Run key
+        else:
+            # Deleting a non-existent task is harmless (returns non-zero + text).
+            subprocess.run(
+                ["schtasks", "/Delete", "/TN", _AUTOSTART_TASK_NAME, "/F"],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            _remove_run_key_autostart()
         return None
     except Exception as error:
         return f"{type(error).__name__}: {error}"
@@ -519,8 +633,11 @@ class VlessApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("MeDVeD")
-        self.geometry("1040x820")
-        self.minsize(920, 720)
+        self.geometry("1080x820")
+        # Right-side import/subscription panel is 420 px. With the profile list
+        # on the left, the actions row, and padding, 1000 px is the lowest the
+        # user can shrink to without the right panel disappearing.
+        self.minsize(1000, 720)
         try:
             self.iconbitmap(default=str(_asset_path("medved.ico")))
         except Exception:
@@ -552,6 +669,9 @@ class VlessApp(ctk.CTk):
         self.log_widget: Optional[Any] = None
         self.profile_list: Optional[Any] = None
         self.active_server_var = StringVar(value="—")
+        self.external_ip_var = StringVar(value="")
+        self.profile_filter_var = StringVar(value="")
+        self.profile_filter_var.trace_add("write", lambda *_a: self.refresh_profiles())
         self.server_choice_var = StringVar(value=self._AUTO_KEY)
 
         # Stats tracking
@@ -573,7 +693,6 @@ class VlessApp(ctk.CTk):
         self.active_var = BooleanVar(value=False)
         self.auto_connect_var = BooleanVar(value=self.settings.auto_connect_enabled)
         self.subscription_refresh_var = StringVar(value=str(self.settings.subscription_refresh_hours))
-        self.notifications_var = BooleanVar(value=self.settings.notifications_enabled)
         self.bypass_ru_var = BooleanVar(value=self.settings.bypass_ru)
         self.kill_switch_var = BooleanVar(value=self.settings.kill_switch)
         self.urltest_auto_switch_var = BooleanVar(value=self.settings.urltest_auto_switch)
@@ -681,9 +800,7 @@ class VlessApp(ctk.CTk):
         return frame
 
     def _build_ui(self) -> None:
-        self.geometry("960x760")
-        self.minsize(880, 720)
-
+        # geometry/minsize already set in __init__ — don't override here.
         self._burger_visible = False
         self._burger_dropdown: Optional[Any] = None
 
@@ -750,10 +867,11 @@ class VlessApp(ctk.CTk):
         button_box = ctk.CTkFrame(body, fg_color="transparent")
         button_box.pack(fill=BOTH, expand=True)
 
-        ctk.CTkLabel(button_box, text=self._t("server"), font=ctk.CTkFont(size=11), text_color="#888888").pack(pady=(8, 0))
+        ctk.CTkLabel(button_box, text=self._t("server"), font=ctk.CTkFont(size=13), text_color="#888888").pack(pady=(8, 0))
         self.server_button = ctk.CTkButton(
             button_box, text=f"{self._format_choice(self.server_choice_var.get())}  ▼",
-            width=320, height=32,
+            width=360, height=36,
+            font=ctk.CTkFont(size=13),
             fg_color="#3a3a3a", hover_color="#4a4a4a",
             text_color="#e0e0e0",
             command=self._toggle_server_menu,
@@ -772,15 +890,19 @@ class VlessApp(ctk.CTk):
         self.main_button.pack(pady=(24, 10))
 
         ctk.CTkLabel(
-            button_box, text=self._t("active_server"), font=ctk.CTkFont(size=10), text_color="#888888",
+            button_box, text=self._t("active_server"), font=ctk.CTkFont(size=13), text_color="#888888",
         ).pack(pady=(8, 0))
         ctk.CTkLabel(
-            button_box, textvariable=self.active_server_var, font=ctk.CTkFont(size=13, weight="bold"),
+            button_box, textvariable=self.active_server_var, font=ctk.CTkFont(size=18, weight="bold"),
         ).pack()
+        ctk.CTkLabel(
+            button_box, textvariable=self.external_ip_var, font=ctk.CTkFont(size=12),
+            text_color=("#1f6aa5", "#5ba6dc"),
+        ).pack(pady=(2, 0))
         self.sub_info_label = ctk.CTkLabel(
-            button_box, text="", font=ctk.CTkFont(size=10), text_color="#888888",
+            button_box, text="", font=ctk.CTkFont(size=13), text_color="#aaaaaa",
         )
-        self.sub_info_label.pack(pady=(4, 0))
+        self.sub_info_label.pack(pady=(6, 0))
         self.after(100, self._refresh_subscription_info_label)
 
         stats_card = ctk.CTkFrame(body, corner_radius=10)
@@ -788,17 +910,17 @@ class VlessApp(ctk.CTk):
         stats_grid = ctk.CTkFrame(stats_card, fg_color="transparent")
         stats_grid.pack(fill=X, padx=14, pady=12)
 
-        ctk.CTkLabel(stats_grid, text="⬇", font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ctk.CTkLabel(stats_grid, textvariable=self.dl_speed_var, text_color="#4caf50", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=1, sticky="w", padx=(0, 20))
-        ctk.CTkLabel(stats_grid, text="⬆", font=ctk.CTkFont(size=14)).grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ctk.CTkLabel(stats_grid, textvariable=self.ul_speed_var, text_color="#ef5350", font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=3, sticky="w", padx=(0, 20))
-        ctk.CTkLabel(stats_grid, text="📶", font=ctk.CTkFont(size=14)).grid(row=0, column=4, sticky="w", padx=(0, 6))
-        ctk.CTkLabel(stats_grid, textvariable=self.ping_var, font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=5, sticky="w")
+        ctk.CTkLabel(stats_grid, text="⬇", font=ctk.CTkFont(size=18)).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ctk.CTkLabel(stats_grid, textvariable=self.dl_speed_var, text_color="#4caf50", font=ctk.CTkFont(size=17, weight="bold")).grid(row=0, column=1, sticky="w", padx=(0, 24))
+        ctk.CTkLabel(stats_grid, text="⬆", font=ctk.CTkFont(size=18)).grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ctk.CTkLabel(stats_grid, textvariable=self.ul_speed_var, text_color="#ef5350", font=ctk.CTkFont(size=17, weight="bold")).grid(row=0, column=3, sticky="w", padx=(0, 24))
+        ctk.CTkLabel(stats_grid, text="📶", font=ctk.CTkFont(size=18)).grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ctk.CTkLabel(stats_grid, textvariable=self.ping_var, font=ctk.CTkFont(size=17, weight="bold")).grid(row=0, column=5, sticky="w")
 
-        ctk.CTkLabel(stats_grid, text="📥 Всего:", font=ctk.CTkFont(size=10), text_color="#888888").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ctk.CTkLabel(stats_grid, textvariable=self.total_dl_var, font=ctk.CTkFont(size=11)).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
-        ctk.CTkLabel(stats_grid, text="📤 Всего:", font=ctk.CTkFont(size=10), text_color="#888888").grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        ctk.CTkLabel(stats_grid, textvariable=self.total_ul_var, font=ctk.CTkFont(size=11)).grid(row=2, column=2, columnspan=2, sticky="w", pady=(2, 0))
+        ctk.CTkLabel(stats_grid, text="📥 Всего:", font=ctk.CTkFont(size=13), text_color="#aaaaaa").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ctk.CTkLabel(stats_grid, textvariable=self.total_dl_var, font=ctk.CTkFont(size=14)).grid(row=1, column=2, columnspan=2, sticky="w", pady=(10, 0))
+        ctk.CTkLabel(stats_grid, text="📤 Всего:", font=ctk.CTkFont(size=13), text_color="#aaaaaa").grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ctk.CTkLabel(stats_grid, textvariable=self.total_ul_var, font=ctk.CTkFont(size=14)).grid(row=2, column=2, columnspan=2, sticky="w", pady=(2, 0))
 
         self.sparkline = Canvas(stats_grid, height=50, bg="#1a1a1a", highlightthickness=0)
         self.sparkline.grid(row=3, column=0, columnspan=6, sticky="we", pady=(10, 0))
@@ -925,13 +1047,19 @@ class VlessApp(ctk.CTk):
 
     def refresh_profiles(self) -> None:
         self._refresh_server_menu()
+        self._refresh_tray_menu()
         if self.profile_list is None:
             return
         for item in self.profile_list.get_children():
             self.profile_list.delete(item)
 
+        filter_text = getattr(self, "profile_filter_var", None)
+        needle = filter_text.get().strip().lower() if filter_text is not None else ""
+
         groups: Dict[str, List[int]] = {}
         for index, profile in enumerate(self.profiles):
+            if needle and needle not in profile.name.lower() and needle not in profile.server.lower():
+                continue
             groups.setdefault(profile.source_url or "", []).append(index)
 
         for source_url, indices in sorted(groups.items(), key=lambda kv: (kv[0] == "", kv[0])):
@@ -950,13 +1078,17 @@ class VlessApp(ctk.CTk):
                 profile = self.profiles[index]
                 transport = f"{profile.protocol}/{profile.type or 'tcp'}"
                 ping = self._format_profile_ping(self._profile_ping_key(profile))
+                auto_marker = "✓" if profile.enabled else "✗"
                 self.profile_list.insert(
                     group_iid, END, iid=str(index),
                     text=profile.name,
-                    values=(profile.server, transport, ping),
+                    values=(profile.server, transport, ping, auto_marker),
                 )
 
-        if self.selected_uuid is not None:
+        # Truthy check, not `is not None`: selected_uuid is "" for non-VLESS
+        # profiles, and an empty-string match would re-select the first
+        # passwordless/uuidless profile instead of the one the user picked.
+        if self.selected_uuid:
             for index, profile in enumerate(self.profiles):
                 if profile.uuid == self.selected_uuid:
                     self.profile_list.selection_set(str(index))
@@ -980,8 +1112,10 @@ class VlessApp(ctk.CTk):
         value = self._profile_pings[key]
         if value is None:
             return "timeout"
-        if value < 1.0:
-            return "<1 мс"
+        # Show one decimal for sub-10ms so the user sees "3.4 мс" instead of a
+        # suspicious "<1 мс" — that shortcut hid the real measurement.
+        if value < 10.0:
+            return f"{value:.1f} мс"
         return f"{int(round(value))} мс"
 
     def log(self, message: str) -> None:
@@ -1139,6 +1273,7 @@ class VlessApp(ctk.CTk):
                         (p.uuid or p.password, p.server, p.port) for p in self.profiles
                     }
                     added = 0
+                    excluded = 0
                     for profile in all_new_profiles:
                         key = (profile.uuid or profile.password, profile.server, profile.port)
                         if key in existing_keys:
@@ -1146,9 +1281,16 @@ class VlessApp(ctk.CTk):
                         self.profiles.append(profile)
                         existing_keys.add(key)
                         added += 1
+                        if not profile.enabled:
+                            excluded += 1
                     save_profiles(self.profiles, self.settings)
                     self.refresh_profiles()
                     self.log(f"Подписки обновлены, добавлено новых профилей: {added}")
+                    if excluded:
+                        self.log(
+                            f"Авто-фильтр: {added - excluded} европейских серверов включены, "
+                            f"{excluded} исключены (не Европа или «Обход»)"
+                        )
                     if added > 0:
                         self._show_snackbar(f"Подписки обновлены: +{added} профилей", "ok")
                     else:
@@ -1212,6 +1354,7 @@ class VlessApp(ctk.CTk):
                 if self._is_fake_profile(profile):
                     got_fake = True
                     continue
+                profile.enabled = self._default_auto_enabled(profile.name)
                 profiles.append(profile)
             if profiles:
                 return profiles
@@ -1292,6 +1435,49 @@ class VlessApp(ctk.CTk):
                 return True
         return False
 
+    # Profiles whose name contains any of these substrings are excluded from
+    # the default auto pool — they're typically routing/bypass helpers, not
+    # regular VPN endpoints.
+    _AUTO_EXCLUDE_KEYWORDS = ("обход", "bypass")
+
+    # Profiles included by default. Match on country name in Russian, English,
+    # and the corresponding flag emoji. Cities deliberately left out — they
+    # vary too much and would produce false positives without country context.
+    _AUTO_INCLUDE_KEYWORDS = (
+        # Russian country names
+        "германия", "франция", "нидерланды", "голландия", "великобритания",
+        "англия", "италия", "испания", "польша", "швеция", "финляндия",
+        "норвегия", "дания", "бельгия", "австрия", "швейцария",
+        "чехия", "португалия", "ирландия", "греция",
+        "латвия", "литва", "эстония", "словакия", "венгрия",
+        "хорватия", "румыния", "болгария", "словения", "люксембург",
+        "исландия", "европа",
+        # English
+        "germany", "france", "netherlands", "holland", "united kingdom",
+        "italy", "spain", "poland", "sweden", "finland",
+        "norway", "denmark", "belgium", "austria", "switzerland",
+        "czech", "portugal", "ireland", "greece",
+        "latvia", "lithuania", "estonia", "slovakia", "hungary",
+        "croatia", "romania", "bulgaria", "slovenia", "luxembourg",
+        "iceland", "europe",
+        # Flag emoji (case-insensitive comparison ignores these, but matching
+        # works fine because they're literal byte sequences).
+        "🇩🇪", "🇫🇷", "🇳🇱", "🇬🇧", "🇮🇹", "🇪🇸", "🇵🇱", "🇸🇪", "🇫🇮",
+        "🇳🇴", "🇩🇰", "🇧🇪", "🇦🇹", "🇨🇭", "🇨🇿", "🇵🇹", "🇮🇪", "🇬🇷",
+        "🇱🇻", "🇱🇹", "🇪🇪", "🇸🇰", "🇭🇺", "🇭🇷", "🇷🇴", "🇧🇬", "🇸🇮",
+        "🇱🇺", "🇮🇸", "🇪🇺",
+    )
+
+    @classmethod
+    def _default_auto_enabled(cls, name: str) -> bool:
+        """Default rule for new profiles: include only European servers, and
+        never anything that smells like a routing-bypass helper. The user can
+        still re-enable any excluded profile manually via the 'В авто' column."""
+        lower = name.lower()
+        if any(keyword in lower for keyword in cls._AUTO_EXCLUDE_KEYWORDS):
+            return False
+        return any(keyword in lower for keyword in cls._AUTO_INCLUDE_KEYWORDS)
+
     def _try_parse_clash_yaml(self, text: str, source_url: str) -> List[VlessProfile]:
         """Clash/Clash Meta YAML subscriptions have 'proxies:' top-level key.
         We extract the list and map each proxy dict to a VlessProfile."""
@@ -1316,6 +1502,7 @@ class VlessApp(ctk.CTk):
                 continue
             profile = self._clash_entry_to_profile(entry, source_url)
             if profile is not None and not self._is_fake_profile(profile):
+                profile.enabled = self._default_auto_enabled(profile.name)
                 result.append(profile)
         return result
 
@@ -1423,6 +1610,118 @@ class VlessApp(ctk.CTk):
         self.profiles.extend(new_profiles)
         save_profiles(self.profiles, self.settings)
         self.refresh_profiles()
+        enabled = sum(1 for p in new_profiles if p.enabled)
+        excluded = len(new_profiles) - enabled
+        if excluded:
+            self.log(
+                f"Авто-фильтр: {enabled} европейских серверов включены, "
+                f"{excluded} исключены (не Европа или содержат «Обход»)"
+            )
+
+    def apply_default_auto_filter_now(self) -> None:
+        """Re-apply the default European-only filter to every profile in the
+        list. Useful for users who imported subscriptions before this feature
+        existed and want to bring older profiles in line with the new default."""
+        if not self.profiles:
+            self._show_toast("MeDVeD", "Нет профилей для фильтрации.", "info")
+            return
+        if not self._show_confirm(
+            "Применить авто-фильтр",
+            "Сбросить колонку «В авто» по дефолтному правилу:\n"
+            "• европейские серверы → ✓\n"
+            "• «Обход» и не-европейские → ✗\n\n"
+            "Твои ручные исключения будут перезаписаны.",
+        ):
+            return
+        changed = 0
+        for index, p in enumerate(self.profiles):
+            new_state = self._default_auto_enabled(p.name)
+            if p.enabled != new_state:
+                p.enabled = new_state
+                changed += 1
+                if self.profile_list is not None:
+                    try:
+                        self.profile_list.set(str(index), "auto", "✓" if new_state else "✗")
+                    except Exception:
+                        pass
+        if changed:
+            save_profiles(self.profiles, self.settings)
+        included = sum(1 for p in self.profiles if p.enabled)
+        self._show_snackbar(
+            f"Фильтр применён: {included} включено, {len(self.profiles) - included} исключено",
+            "ok", duration_ms=3500,
+        )
+
+    def toggle_auto_inclusion(self) -> None:
+        """Toggle whether the selected profile(s) participate in auto mode.
+        Disabled profiles still show in the manual dropdown and can be selected
+        directly, but they're skipped when 'Auto' picks across all servers."""
+        targets: List[VlessProfile] = []
+        if self.selected_indices:
+            targets = [self.profiles[i] for i in self.selected_indices]
+        elif self.selected_group_url is not None:
+            group_url = self.selected_group_url
+            if group_url == "_manual":
+                targets = [p for p in self.profiles if not p.source_url]
+            else:
+                targets = [p for p in self.profiles if p.source_url == group_url]
+        if not targets:
+            self._show_toast(
+                "MeDVeD",
+                "Выберите профиль или группу — потом эта кнопка переключит участие в авто-режиме.",
+                "info",
+            )
+            return
+        # If at least one is enabled, treat the action as "exclude all".
+        # If all are disabled, treat it as "include all back". Predictable.
+        new_state = not any(p.enabled for p in targets)
+        target_ids = {id(p) for p in targets}
+        for p in targets:
+            p.enabled = new_state
+        save_profiles(self.profiles, self.settings)
+        marker = "✓" if new_state else "✗"
+        if self.profile_list is not None:
+            for index, p in enumerate(self.profiles):
+                if id(p) in target_ids:
+                    try:
+                        self.profile_list.set(str(index), "auto", marker)
+                    except Exception:
+                        pass
+        word = "включены" if new_state else "исключены"
+        self._show_snackbar(f"Профили {word} {'в' if new_state else 'из'} авто ({len(targets)})", "ok")
+
+    def _on_profile_click(self, event) -> None:
+        """Single click on the 'auto' column flips that profile's enabled flag.
+        Click elsewhere does nothing — Treeview's default selection has already
+        kicked in by the time ButtonRelease fires. We update just the affected
+        cell in-place instead of rebuilding the whole list, so the user's
+        current selection survives."""
+        if self.profile_list is None:
+            return
+        region = self.profile_list.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        column = self.profile_list.identify_column(event.x)  # "#1", "#2", ...
+        if column != "#4":  # auto column is the 4th (server/type/ping/auto)
+            return
+        iid = self.profile_list.identify_row(event.y)
+        if not iid or iid.startswith("g:"):
+            return
+        try:
+            index = int(iid)
+        except ValueError:
+            return
+        if not (0 <= index < len(self.profiles)):
+            return
+        self.profiles[index].enabled = not self.profiles[index].enabled
+        save_profiles(self.profiles, self.settings)
+        try:
+            self.profile_list.set(
+                str(index), "auto",
+                "✓" if self.profiles[index].enabled else "✗",
+            )
+        except Exception:
+            pass
 
     def delete_profile(self) -> None:
         targets: List[VlessProfile] = []
@@ -1494,6 +1793,11 @@ class VlessApp(ctk.CTk):
             if not group_profiles:
                 self._show_toast("MeDVeD", "В группе нет профилей.", "info")
                 return
+            # Same filter as the top-level auto: respect user-disabled profiles,
+            # fall back to all-in-group if nothing is left enabled.
+            enabled_in_group = [p for p in group_profiles if p.enabled]
+            if enabled_in_group:
+                group_profiles = enabled_in_group
             self.log(f"Подготовка URLTest: {len(group_profiles)} профилей из группы")
             connect_target = group_profiles
             active_name = f"Авто (URLTest, {len(group_profiles)} серверов)"
@@ -1690,7 +1994,19 @@ class VlessApp(ctk.CTk):
         self._update_active_state(False)
 
     def _on_close(self) -> None:
-        if self.settings.minimize_to_tray and self._tray_icon is not None and not self._quitting:
+        # While "minimise to tray" is on, the X button should hide to tray, not
+        # quit — that's what the explicit "Выход" item is for. But ONLY if a
+        # tray icon actually exists: withdrawing with no icon strands the app as
+        # an invisible, unreachable process (the exact "closed but didn't go to
+        # tray" symptom). So try to (re)create the icon, and if that still
+        # fails, quit honestly instead of zombifying.
+        if self.settings.minimize_to_tray and not self._quitting:
+            if self._tray_icon is None:
+                self._init_tray()
+            if self._tray_icon is None:
+                self.log("Трей недоступен — закрываю приложение вместо сворачивания в трей")
+                self._real_quit()
+                return
             self.withdraw()
             return
         self._real_quit()
@@ -1716,12 +2032,48 @@ class VlessApp(ctk.CTk):
             pending = getattr(self, "_pending_active_name", "")
             if pending:
                 self.active_server_var.set(pending)
+            self.external_ip_var.set("определяю IP…")
+            # Give TUN a moment to settle, then resolve the external IP through it.
+            self.after(1500, self._refresh_external_ip)
         else:
             self._reset_stats()
             self.active_server_var.set("—")
+            self.external_ip_var.set("")
         self._refresh_tray_icon(active)
         if getattr(self, "main_button", None) is not None:
             self.main_button.set_state(active, text=(self._t("connected") if active else self._t("connect")))
+
+    def _refresh_external_ip(self) -> None:
+        """Ask a public 'what's my IP' endpoint via the now-active VPN tunnel.
+        Since sing-box is in TUN mode, traffic from this process already goes
+        through it — no proxy plumbing needed. Done in a worker thread so the
+        GUI never blocks on a slow response."""
+        if not self.active_var.get():
+            return
+
+        def worker() -> None:
+            ip: Optional[str] = None
+            for url in ("https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"):
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": f"MeDVeD/{__version__}"})
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        text = resp.read().decode("utf-8", errors="replace").strip()
+                    # Sanity check: looks like an IP, not an HTML error page.
+                    if text and all(c in "0123456789." for c in text[:64].replace(":", "").replace("a", "").replace("b", "").replace("c", "").replace("d", "").replace("e", "").replace("f", "")):
+                        ip = text[:64]
+                        break
+                    if text and len(text) <= 64:
+                        ip = text
+                        break
+                except Exception:
+                    continue
+            if not self.active_var.get():
+                return
+            self.after(0, lambda: self.external_ip_var.set(
+                f"🌐 Внешний IP: {ip}" if ip else "не удалось определить IP"
+            ))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _reset_stats(self) -> None:
         self._prev_rx = 0.0
@@ -1899,7 +2251,6 @@ class VlessApp(ctk.CTk):
             elif not self.settings.auto_connect_key:
                 self.log("⚠ Автоподключение включено, но профиль не выбран — выберите профиль и снова включите")
 
-        self.settings.notifications_enabled = bool(self.notifications_var.get())
         self.settings.bypass_ru = bool(self.bypass_ru_var.get())
         self.settings.urltest_auto_switch = bool(self.urltest_auto_switch_var.get())
         new_appearance = str(self.appearance_var.get())
@@ -1919,12 +2270,27 @@ class VlessApp(ctk.CTk):
         prev_min = self.settings.start_minimized
         self.settings.auto_start_with_windows = bool(self.autostart_var.get())
         self.settings.start_minimized = bool(self.start_minimized_var.get())
-        if (self.settings.auto_start_with_windows != prev_autostart) or (self.settings.start_minimized != prev_min):
+        autostart_changed = self.settings.auto_start_with_windows != prev_autostart
+        min_changed = self.settings.start_minimized != prev_min
+        # Only (re)touch the scheduled task when autostart itself is involved:
+        # either it was toggled, or it's already ON and the minimized flag (which
+        # is baked into the task's launch args) changed. Toggling "start minimised"
+        # while autostart is OFF must NOT call schtasks — that needs admin and has
+        # nothing to do with the task. start_minimized is still saved below.
+        if autostart_changed or (self.settings.auto_start_with_windows and min_changed):
             autostart_error = _set_autostart(
                 self.settings.auto_start_with_windows, self.settings.start_minimized,
             )
             if autostart_error:
-                self._show_snackbar(f"Автозапуск: {autostart_error}", "warn", duration_ms=4000)
+                self._show_snackbar(f"Автозапуск: {autostart_error}", "warn", duration_ms=5000)
+                # The task wasn't created/removed — don't leave the checkbox
+                # claiming a state we failed to apply. Revert settings + vars.
+                # Re-setting the vars re-enters _apply_settings_now, but with
+                # values now equal to settings, so no second _set_autostart call.
+                self.settings.auto_start_with_windows = prev_autostart
+                self.settings.start_minimized = prev_min
+                self.autostart_var.set(prev_autostart)
+                self.start_minimized_var.set(prev_min)
         was_kill_switch = self.settings.kill_switch
         self.settings.kill_switch = bool(self.kill_switch_var.get())
         if was_kill_switch and not self.settings.kill_switch:
@@ -2082,7 +2448,13 @@ class VlessApp(ctk.CTk):
             if len(self.profiles) == 1:
                 self.selected_indices = [0]
             else:
-                self.selected_indices = list(range(len(self.profiles)))
+                # In auto mode, skip profiles the user explicitly excluded.
+                # Falls back to "all" if every profile happens to be disabled,
+                # so auto-connect can't deadlock.
+                enabled_indices = [i for i, p in enumerate(self.profiles) if p.enabled]
+                if not enabled_indices:
+                    enabled_indices = list(range(len(self.profiles)))
+                self.selected_indices = enabled_indices
         else:
             match_idx = next((i for i, p in enumerate(self.profiles) if p.name == choice), None)
             if match_idx is None:
@@ -2103,29 +2475,46 @@ class VlessApp(ctk.CTk):
         left = ctk.CTkFrame(wrapper, fg_color="transparent")
         left.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 10))
 
-        right = ctk.CTkFrame(wrapper, width=300, fg_color="transparent")
+        right = ctk.CTkFrame(wrapper, width=420, fg_color="transparent")
         right.pack(side=RIGHT, fill=Y)
         right.pack_propagate(False)
 
         list_section = self._section(left, "Профили")
         list_section.pack(fill=BOTH, expand=True)
 
+        filter_row = ctk.CTkFrame(list_section, fg_color="transparent")
+        filter_row.pack(fill=X, padx=10, pady=(2, 4))
+        ctk.CTkLabel(filter_row, text="🔍", font=ctk.CTkFont(size=14)).pack(side=LEFT, padx=(0, 6))
+        filter_entry = ctk.CTkEntry(
+            filter_row, textvariable=self.profile_filter_var, height=28,
+            placeholder_text="Фильтр по имени или адресу сервера",
+        )
+        filter_entry.pack(side=LEFT, fill=X, expand=True)
+        _bind_clipboard_shortcuts(filter_entry)
+
         tree_holder = ctk.CTkFrame(list_section, fg_color="transparent")
         tree_holder.pack(fill=BOTH, expand=True, padx=10, pady=(2, 8))
         self.profile_list = ttk.Treeview(
-            tree_holder, columns=("server", "type", "ping"), show="tree headings",
+            tree_holder, columns=("server", "type", "ping", "auto"), show="tree headings",
             selectmode="extended", style="Dark.Treeview",
         )
         self.profile_list.heading("#0", text="Имя")
         self.profile_list.heading("server", text="Сервер")
         self.profile_list.heading("type", text="Транспорт")
         self.profile_list.heading("ping", text="Пинг")
-        self.profile_list.column("#0", width=240, anchor="w")
-        self.profile_list.column("server", width=180, anchor="w")
+        self.profile_list.heading("auto", text="В авто")
+        self.profile_list.column("#0", width=220, anchor="w")
+        self.profile_list.column("server", width=170, anchor="w")
         self.profile_list.column("type", width=100, anchor="center")
         self.profile_list.column("ping", width=80, anchor="center")
+        self.profile_list.column("auto", width=60, anchor="center")
         self.profile_list.pack(fill=BOTH, expand=True)
         self.profile_list.bind("<<TreeviewSelect>>", self.on_profile_select)
+        # ButtonRelease fires after the row gets selected, so a single click on
+        # the "auto" column both selects and toggles. We don't use Double-Click
+        # because that requires the user to know about it — a single click
+        # right on the ✓/✗ is the intuitive gesture.
+        self.profile_list.bind("<ButtonRelease-1>", self._on_profile_click)
         self.refresh_profiles()
 
         actions = ctk.CTkFrame(left, fg_color="transparent")
@@ -2133,8 +2522,9 @@ class VlessApp(ctk.CTk):
         for text, cmd in [
             ("Удалить", self.delete_profile),
             ("Скопировать ссылку", self._copy_selected_link),
+            ("Вкл/Выкл в авто", self.toggle_auto_inclusion),
+            ("Авто-фильтр (Европа)", self.apply_default_auto_filter_now),
             ("Проверить пинги", self.test_all_pings),
-            ("Speedtest", self.test_all_speeds),
             ("Экспорт", self.export_profiles),
             ("Импорт", self.import_profiles_from_file),
         ]:
@@ -2142,20 +2532,32 @@ class VlessApp(ctk.CTk):
 
         details = self._section(right, "Импорт ссылки")
         details.pack(fill=X)
-        ctk.CTkLabel(details, text="vless / vmess / trojan / ss / hysteria2", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(0, 2))
-        self.link_entry = ctk.CTkEntry(details, textvariable=self.link_var)
-        self.link_entry.pack(fill=X, padx=12, pady=4)
+        ctk.CTkLabel(
+            details, text="vless / vmess / trojan / ss / hysteria2 / tuic",
+            font=ctk.CTkFont(size=12), text_color="#aaaaaa",
+            wraplength=380, justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+        self.link_entry = ctk.CTkEntry(
+            details, textvariable=self.link_var, height=32,
+            placeholder_text="Вставьте ссылку",
+        )
+        self.link_entry.pack(fill=X, padx=12, pady=(2, 4))
         _bind_clipboard_shortcuts(self.link_entry)
-        ctk.CTkButton(details, text="Добавить профиль", command=self.import_profile, height=32).pack(fill=X, padx=12, pady=(8, 10))
+        ctk.CTkButton(details, text="Добавить профиль", command=self.import_profile, height=34).pack(fill=X, padx=12, pady=(8, 10))
 
         sub_box = self._section(right, "Подписка")
         sub_box.pack(fill=X, pady=(10, 0))
-        ctk.CTkLabel(sub_box, text="URL подписки", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(0, 2))
-        self.subscription_entry = ctk.CTkEntry(sub_box, textvariable=self.subscription_var)
-        self.subscription_entry.pack(fill=X, padx=12, pady=4)
+        ctk.CTkLabel(
+            sub_box, text="URL подписки", font=ctk.CTkFont(size=12), text_color="#aaaaaa",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+        self.subscription_entry = ctk.CTkEntry(
+            sub_box, textvariable=self.subscription_var, height=32,
+            placeholder_text="https://…",
+        )
+        self.subscription_entry.pack(fill=X, padx=12, pady=(2, 4))
         _bind_clipboard_shortcuts(self.subscription_entry)
-        ctk.CTkButton(sub_box, text="Импортировать подписку", command=self.import_subscription, height=30).pack(fill=X, padx=12, pady=(6, 4))
-        ctk.CTkButton(sub_box, text="Обновить все подписки", command=self.refresh_subscriptions, height=30).pack(fill=X, padx=12, pady=(0, 10))
+        ctk.CTkButton(sub_box, text="Импортировать подписку", command=self.import_subscription, height=34).pack(fill=X, padx=12, pady=(6, 4))
+        ctk.CTkButton(sub_box, text="Обновить все подписки", command=self.refresh_subscriptions, height=34).pack(fill=X, padx=12, pady=(0, 10))
 
         self._views["profiles"] = view
 
@@ -2198,6 +2600,7 @@ class VlessApp(ctk.CTk):
         ("📊  Журнал", "log_view"),
         ("---", None),
         ("⚙  Настройки", "settings_view"),
+        ("📌  Закрепить в трее", "pin_to_tray"),
         ("---", None),
         ("✕  Выход", "quit"),
     ]
@@ -2223,6 +2626,7 @@ class VlessApp(ctk.CTk):
             "profiles_view": lambda: self._show_view("profiles"),
             "log_view":      lambda: self._show_view("log"),
             "settings_view": lambda: self._show_view("settings"),
+            "pin_to_tray":   self._open_tray_settings,
             "quit":          self._real_quit,
             "update":        self._start_update_flow,
         }
@@ -2309,16 +2713,14 @@ class VlessApp(ctk.CTk):
         wrapper = ctk.CTkScrollableFrame(view, fg_color="transparent")
         wrapper.pack(fill=BOTH, expand=True, padx=16, pady=(0, 8))
 
-        ctk.CTkLabel(wrapper, text="Путь к sing-box", font=ctk.CTkFont(size=11)).pack(anchor="w")
-        self.singbox_entry = ctk.CTkEntry(wrapper, textvariable=self.settings_path_var)
-        self.singbox_entry.pack(fill=X, pady=(2, 10))
-        _bind_clipboard_shortcuts(self.singbox_entry)
+        # sing-box.exe встроен в exe — поле "Путь к sing-box" убрано из UI,
+        # power-user может задать кастомный путь через settings.json (поле
+        # sing_box_path), приложение его подхватит первым из кандидатов.
 
         for text, var in [
             ("Автоподключение к выбранному профилю при запуске", self.auto_connect_var),
             ("Запускать MeDVeD автоматически при старте Windows", self.autostart_var),
             ("Стартовать свёрнутым в трей", self.start_minimized_var),
-            ("Системные уведомления (ошибки VPN, обновление подписок)", self.notifications_var),
             ("Российские сайты в обход VPN (geosite-ru + geoip-ru)", self.bypass_ru_var),
             ("Kill switch (блокировать интернет при падении VPN)", self.kill_switch_var),
             ("Авто-режим: переподключаться к быстрейшему серверу каждые 5 мин", self.urltest_auto_switch_var),
@@ -2477,7 +2879,6 @@ class VlessApp(ctk.CTk):
             self.auto_connect_var,
             self.autostart_var,
             self.start_minimized_var,
-            self.notifications_var,
             self.bypass_ru_var,
             self.kill_switch_var,
             self.urltest_auto_switch_var,
@@ -2486,7 +2887,6 @@ class VlessApp(ctk.CTk):
             self.subscription_refresh_var,
         ):
             var.trace_add("write", self._apply_settings_now)
-        self.singbox_entry.bind("<FocusOut>", lambda _e: self._apply_settings_now())
 
         self._proc_rules_reload = reload_proc_tree
         self._route_rules_reload = reload_route_tree
@@ -2611,8 +3011,7 @@ class VlessApp(ctk.CTk):
         No darkening backdrop on purpose — Tk widgets can't be alpha-blended, and
         an opaque dimmer would hide the rest of the UI. Instead the card floats
         with a subtle border, leaving the underlying content fully visible."""
-        self._dismiss_overlay()
-        self._overlay = None
+        self._dismiss_overlay()  # already clears self._overlay / _overlay_card
 
         card = ctk.CTkFrame(
             self, corner_radius=14,
@@ -2738,20 +3137,71 @@ class VlessApp(ctk.CTk):
             draw.ellipse((2, 2, size - 2, size - 2), fill=color)
             return image
 
+    _TRAY_SERVERS_LIMIT = 25
+
+    def _tray_server_action(self, profile: VlessProfile):
+        """Build a pystray menu callback for one server. pystray inspects
+        action.__code__.co_argcount and raises ValueError for any callable with
+        MORE than 2 params. The old `lambda _icon=None, _item=None, p=profile:`
+        had THREE params (the p=profile default-arg trick to capture the loop
+        var counts as a positional!), so EVERY tray rebuild crashed once the
+        user had profiles — killing the whole tray icon. Capturing `profile`
+        via this closure keeps the handler at 2 params, which pystray accepts."""
+        def handler(icon=None, item=None) -> None:
+            self.after(0, self._tray_connect_to, profile)
+        return handler
+
+    def _build_tray_menu(self) -> Any:
+        """Server picker submenu rebuilt from the current profile list. Limited
+        to N items because some Windows menu implementations break with very
+        long popups, and a tray flyout with 200+ entries is unusable anyway."""
+        servers = pystray.Menu(*[
+            pystray.MenuItem(profile.name, self._tray_server_action(profile))
+            for profile in self.profiles[: self._TRAY_SERVERS_LIMIT]
+            if profile.name
+        ]) if self.profiles else None
+
+        items = [
+            pystray.MenuItem("Открыть", self._tray_show, default=True),
+            pystray.MenuItem("Подключить (Авто)", self._tray_connect),
+        ]
+        if servers is not None and len(servers.items) > 0:
+            items.append(pystray.MenuItem("Подключить к…", servers))
+        items.extend([
+            pystray.MenuItem("Отключить", self._tray_disconnect),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Выход", self._tray_quit),
+        ])
+        return pystray.Menu(*items)
+
+    def _refresh_tray_menu(self) -> None:
+        """Push the latest profile list into the live tray icon."""
+        if self._tray_icon is None:
+            return
+        try:
+            self._tray_icon.menu = self._build_tray_menu()
+        except Exception:
+            pass
+
+    def _tray_connect_to(self, profile: VlessProfile) -> None:
+        """User picked a specific server from the tray flyout — switch the
+        server-choice var to that name and run the same flow as the in-window
+        dropdown picker (auto-reconnect if VPN was already up)."""
+        self.server_choice_var.set(profile.name)
+        if getattr(self, "server_button", None) is not None:
+            try:
+                self.server_button.configure(text=f"{profile.name}  ▼")
+            except Exception:
+                pass
+        self._connect_with_current_choice()
+
     def _init_tray(self) -> None:
         try:
-            menu = pystray.Menu(
-                pystray.MenuItem("Открыть", self._tray_show, default=True),
-                pystray.MenuItem("Подключить", self._tray_connect),
-                pystray.MenuItem("Отключить", self._tray_disconnect),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem("Выход", self._tray_quit),
-            )
             self._tray_icon = pystray.Icon(
                 "MeDVeD",
                 self._make_tray_image(False),
                 "MeDVeD (отключено)",
-                menu,
+                self._build_tray_menu(),
             )
             self._tray_icon.run_detached()
         except Exception as error:
@@ -2766,6 +3216,33 @@ class VlessApp(ctk.CTk):
             self._tray_icon.title = "MeDVeD (подключено)" if active else "MeDVeD (отключено)"
         except Exception:
             pass
+
+    def _open_tray_settings(self) -> None:
+        """Open the Windows page where users decide which tray icons are
+        always visible vs collapsed into the overflow. We can't force this
+        programmatically (it's a per-user OS preference), but we can put
+        the user one click from the right page."""
+        if os.name != "nt":
+            self._show_toast("MeDVeD", "Доступно только на Windows.", "info")
+            return
+        # Show a toast with instructions BEFORE opening Settings, so the user
+        # knows what to look for once the panel appears.
+        self._show_toast(
+            "Закрепление в трее",
+            "Открою «Параметры → Панель задач».\n\n"
+            "Найди раздел «Значки в области уведомлений» (Win 11) "
+            "или «Выберите значки, отображаемые в панели задач» (Win 10), "
+            "затем включи переключатель MeDVeD.\n\n"
+            "Сделать это можно один раз — Windows запомнит выбор.",
+            "info",
+        )
+        # Both URIs work on modern Win 10 / 11.
+        for uri in ("ms-settings:taskbar", "ms-settings:notifications"):
+            try:
+                os.startfile(uri)  # noqa: S606 — startfile is the standard way to launch ms-settings:
+                return
+            except Exception:
+                continue
 
     def _tray_show(self, _icon=None, _item=None) -> None:
         self.after(0, self._show_window)
@@ -2793,6 +3270,22 @@ class VlessApp(ctk.CTk):
             self.log(traceback.format_exc())
 
     def _auto_connect_startup(self) -> None:
+        # If we lack admin AND the window is hidden (start_minimized), do NOT go
+        # through connect_selected — it would pop a blocking Да/Нет admin dialog
+        # on an invisible window, leaving the app looking frozen in the tray.
+        # Notify + skip instead; the user can connect manually, or set up
+        # autostart (the scheduled task launches MeDVeD already-elevated).
+        try:
+            window_hidden = not self.winfo_viewable()
+        except Exception:
+            window_hidden = False
+        if not _is_admin() and window_hidden:
+            self.log("Автоподключение пропущено: нет прав администратора (окно свёрнуто в трей)")
+            self._notify(
+                "MeDVeD",
+                "Автоподключение требует прав администратора — запустите от имени администратора.",
+            )
+            return
         target_key = self.settings.auto_connect_key
         for index, profile in enumerate(self.profiles):
             if self._profile_ping_key(profile) == target_key:
@@ -2813,74 +3306,25 @@ class VlessApp(ctk.CTk):
         if not self.profiles:
             self._show_toast("MeDVeD", "Нет профилей для проверки.", "info")
             return
-        self.log(f"Проверка пинга {len(self.profiles)} профилей...")
+        self.log(f"Проверка пинга {len(self.profiles)} профилей (TLS handshake, параллельно)...")
         snapshot = list(self.profiles)
 
+        def probe(profile: VlessProfile) -> None:
+            ping_ms = _ping_avg(
+                profile.server, profile.port,
+                server_name=profile.sni or profile.server,
+                attempts=3,
+            )
+            key = self._profile_ping_key(profile)
+            self.after(0, self._set_profile_ping, key, ping_ms)
+
         def worker() -> None:
-            for profile in snapshot:
-                ping_ms = _tcp_ping(profile.server, profile.port, timeout=3.0)
-                key = self._profile_ping_key(profile)
-                self.after(0, self._set_profile_ping, key, ping_ms)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(8, len(snapshot))) as pool:
+                list(pool.map(probe, snapshot))
             self.after(0, self.log, "Проверка пинга завершена")
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def test_all_speeds(self) -> None:
-        """TCP-download speedtest against each server's host:port. Measures raw
-        throughput by reading from the open socket — works for any open TCP port
-        without needing a special endpoint. Approximation, but reflects real
-        latency × bandwidth."""
-        if not self.profiles:
-            self._show_toast("MeDVeD", "Нет профилей для проверки.", "info")
-            return
-        self.log(f"Speedtest: {len(self.profiles)} серверов...")
-        snapshot = list(self.profiles)
-
-        def measure(host: str, port: int, duration: float = 2.0) -> Optional[float]:
-            try:
-                start = time.perf_counter()
-                with socket.create_connection((host, port), timeout=4.0) as sock:
-                    sock.settimeout(duration + 1.0)
-                    # Send a generic TLS ClientHello-ish ping so the server keeps
-                    # the socket open and we get bytes back.
-                    sock.sendall(b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00")
-                    received = 0
-                    while time.perf_counter() - start < duration:
-                        try:
-                            chunk = sock.recv(65536)
-                        except socket.timeout:
-                            break
-                        if not chunk:
-                            break
-                        received += len(chunk)
-                    elapsed = time.perf_counter() - start
-                if elapsed <= 0 or received == 0:
-                    return None
-                return (received * 8) / elapsed / 1000.0  # kbps
-            except (OSError, socket.timeout):
-                return None
-
-        def worker() -> None:
-            for profile in snapshot:
-                kbps = measure(profile.server, profile.port)
-                label = "—" if kbps is None else (f"{kbps/1000:.1f} Мбит/с" if kbps >= 1000 else f"{kbps:.0f} Кбит/с")
-                key = self._profile_ping_key(profile)
-                self.after(0, self._set_profile_speed_label, key, label)
-            self.after(0, self.log, "Speedtest завершён")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _set_profile_speed_label(self, key: str, label: str) -> None:
-        # Reuse the ping column to show the speed (we keep ping cache separate).
-        if self.profile_list is None:
-            return
-        for index, profile in enumerate(self.profiles):
-            if self._profile_ping_key(profile) == key:
-                try:
-                    self.profile_list.set(str(index), "ping", label)
-                except Exception:
-                    pass
-                return
 
     def export_profiles(self) -> None:
         if not self.profiles:
@@ -2973,22 +3417,27 @@ class VlessApp(ctk.CTk):
         self._schedule_subscription_refresh()
 
     def _notify(self, title: str, message: str) -> None:
-        if not self.settings.notifications_enabled or plyer_notification is None:
-            return
-        try:
-            plyer_notification.notify(title=title, message=message, app_name="MeDVeD", timeout=5)
-        except Exception:
-            pass
+        # OS-level (Windows toast) notifications are intentionally disabled —
+        # the user wants no system notifications on the computer at all. Every
+        # event that used to pop a toast (VPN crash, kill switch, auto-connect
+        # needs admin) is still recorded in the journal via self.log, and in-app
+        # snackbars cover the cases where the window is open. Kept as a no-op so
+        # the existing call sites stay valid without scattering `if` guards.
+        return
 
     def _copy_selected_link(self) -> None:
-        if self.selected_uuid is None:
-            self._show_toast("MeDVeD", "Выберите профиль.", "info")
-            return
-        profile = next((p for p in self.profiles if p.uuid == self.selected_uuid), None)
+        # Use the index-based selection (works for every protocol), not
+        # selected_uuid — that field is "" for trojan/ss/hysteria2/tuic and
+        # would match the first empty-uuid profile, not the one clicked.
+        profile = self._selected_single_profile()
         if profile is None:
-            self._show_toast("MeDVeD", "Выберите профиль.", "info")
+            self._show_toast("MeDVeD", "Выберите один профиль.", "info")
             return
-        link = profile_to_vless_link(profile)
+        try:
+            link = profile_to_link(profile)
+        except ValueError as error:
+            self._show_toast("MeDVeD", str(error), "warn")
+            return
         self.clipboard_clear()
         self.clipboard_append(link)
         self.log(f"Ссылка скопирована: {profile.name}")
@@ -3009,18 +3458,23 @@ class VlessApp(ctk.CTk):
         self._show_snackbar("Проверяю обновления…", "info", duration_ms=3000)
 
         def worker() -> None:
-            had_update_before = self._update_available
-            self._check_for_update()
-            if not self._update_available and not had_update_before:
+            # Use the return value, not self._update_available: _check_for_update
+            # schedules _on_update_available via after(0), so the flag is still
+            # False here even when an update WAS found — reading it would race and
+            # wrongly flash "you have the latest version" next to a fresh badge.
+            found = self._check_for_update()
+            if not found:
                 self.after(0, lambda: self._show_snackbar(
                     f"У тебя последняя версия (v{__version__})", "ok", duration_ms=3000,
                 ))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _check_for_update(self) -> None:
+    def _check_for_update(self) -> bool:
+        """Returns True if a newer release was found (and _on_update_available
+        was scheduled), False on no-update / network error / missing asset."""
         if GITHUB_REPO.startswith("USERNAME/"):
-            return
+            return False
         api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         req = urllib.request.Request(api, headers={
             "User-Agent": f"MeDVeD/{__version__}",
@@ -3030,10 +3484,10 @@ class VlessApp(ctk.CTk):
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception:
-            return
+            return False
         tag = str(data.get("tag_name", "")).strip()
         if not tag or _parse_version(tag) <= _parse_version(__version__):
-            return
+            return False
         asset_url = ""
         for asset in data.get("assets") or []:
             name = str(asset.get("name", "")).lower()
@@ -3041,8 +3495,9 @@ class VlessApp(ctk.CTk):
                 asset_url = str(asset.get("browser_download_url", ""))
                 break
         if not asset_url:
-            return
+            return False
         self.after(0, self._on_update_available, tag.lstrip("vV"), asset_url)
+        return True
 
     def _on_update_available(self, version: str, asset_url: str) -> None:
         self._update_available = True
@@ -3165,13 +3620,28 @@ class VlessApp(ctk.CTk):
         self.after(2000, self._real_quit)
 
 
+def _set_app_user_model_id() -> None:
+    """Declare a stable AppUserModelID so Windows treats us as a first-class
+    application: tray icon gets a proper position, notifications inherit our
+    name, and the icon survives between sessions. Without this, pystray icons
+    often get hidden into the overflow area by default."""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MeDVeD.VPN.Client")
+    except Exception:
+        pass
+
+
 def main() -> None:
     _install_global_excepthooks()
     _write_log_line(f"=== MeDVeD v{__version__} starting (frozen={getattr(sys,'frozen',False)}) ===")
+    _set_app_user_model_id()
     if not _acquire_single_instance_lock():
         _activate_existing_window("MeDVeD")
         sys.exit(0)
     _cleanup_stale_tun_adapters()
+    _cleanup_stale_kill_switch()
     settings = load_settings()
     ctk.set_appearance_mode(settings.appearance_mode if settings.appearance_mode in ("dark", "light", "system") else "dark")
     ctk.set_default_color_theme("blue")
