@@ -14,8 +14,9 @@
 | `parser.py` | Парсинг ссылок (vless/vmess/trojan/ss/hysteria2/tuic) и экспорт обратно в ссылку |
 | `models.py` | Датаклассы `VlessProfile` и `AppSettings` + сериализация |
 | `storage.py` | Чтение/запись `profiles.json` и `settings.json` в `%LOCALAPPDATA%\vless_manager\` |
-| `MeDVeD.spec` | Конфиг PyInstaller (встраивание sing-box.exe, иконки, иконка приложения) |
-| `.github/workflows/build.yml` | CI: по тегу собирает exe и публикует Release |
+| `MeDVeD.spec` | Конфиг PyInstaller (onedir: папка `MeDVeD\` = `MeDVeD.exe` + `_internal\`, встраивание sing-box.exe и иконок) |
+| `MeDVeD.iss` | Скрипт Inno Setup: заворачивает `dist\MeDVeD\` в установщик `MeDVeD-Setup-*.exe` (per-user, без UAC) |
+| `.github/workflows/build.yml` | CI: по тегу собирает onedir, пакует установщиком и публикует Release |
 | `CHANGELOG.md` | Заметки по версиям; CI берёт отсюда описание релиза |
 
 При разработке (не frozen) личные данные лежат там же — в
@@ -34,7 +35,15 @@ python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 
 python -m PyInstaller --noconfirm MeDVeD.spec
-# Готовый exe лежит в dist\MeDVeD.exe
+# Готовая папка приложения: dist\MeDVeD\ (MeDVeD.exe + _internal\)
+```
+
+Чтобы собрать установщик локально, нужен [Inno Setup 6](https://jrsoftware.org/isdl.php),
+затем:
+
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.9.7 MeDVeD.iss
+# Готовый установщик: installer_output\MeDVeD-Setup-0.9.7.exe
 ```
 
 Для запуска из исходников без сборки достаточно `python app.py` (TUN-режим всё
@@ -50,8 +59,9 @@ python -m PyInstaller --noconfirm MeDVeD.spec
 Дальше [GitHub Actions](.github/workflows/build.yml) сам:
 
 - Скачает свежий sing-box.exe от SagerNet
-- Соберёт MeDVeD.exe через PyInstaller
-- Создаст Release с прикреплённым exe
+- Соберёт папку `dist\MeDVeD\` через PyInstaller (onedir)
+- Упакует её в установщик `MeDVeD-Setup-X.Y.Z.exe` через Inno Setup
+- Создаст Release с прикреплённым установщиком
 - Подтянет описание из CHANGELOG.md
 
 Версию в `app.py` и заголовок в `CHANGELOG.md` легко забыть синхронизировать с

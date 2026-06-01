@@ -220,6 +220,7 @@ __marimo__/
 # MeDVeD-specific overrides
 !MeDVeD.spec
 sing-box.exe
+installer_output/
 _test_*.json
 .sixth/
 memory/

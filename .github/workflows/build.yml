@@ -47,22 +47,40 @@ jobs:
       - name: Build MeDVeD.exe
         run: pyinstaller --noconfirm MeDVeD.spec
 
-      - name: Verify build
+      - name: Verify onedir build
         shell: powershell
         run: |
-          Write-Output "=== dist contents ==="
-          Get-ChildItem dist -Recurse | Select-Object FullName, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
-          Write-Output "=== sing-box.exe in workspace ==="
-          if (Test-Path sing-box.exe) {
-            Write-Output ("sing-box.exe size: {0} MB" -f [math]::Round((Get-Item sing-box.exe).Length/1MB,2))
-          } else {
-            Write-Output "sing-box.exe NOT in workspace root"
+          $ErrorActionPreference = 'Stop'
+          Write-Output "=== dist\MeDVeD (top level) ==="
+          Get-ChildItem dist\MeDVeD | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
+          if (-not (Test-Path dist\MeDVeD\MeDVeD.exe)) { throw "dist\MeDVeD\MeDVeD.exe missing after pyinstaller" }
+          Write-Output ("MeDVeD.exe: {0} MB" -f [math]::Round((Get-Item dist\MeDVeD\MeDVeD.exe).Length/1MB,2))
+          $internal = "dist\MeDVeD\_internal"
+          $py = Get-ChildItem $internal -Filter "python3*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $py) { throw "python3xx.dll missing from _internal" }
+          Write-Output ("python dll: {0}" -f $py.Name)
+          $sb = @("$internal\sing-box.exe","dist\MeDVeD\sing-box.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sb) { throw "sing-box.exe not found in build output" }
+          Write-Output ("sing-box.exe: {0} ({1} MB)" -f $sb, [math]::Round((Get-Item $sb).Length/1MB,2))
+
+      - name: Build installer with Inno Setup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Output "Inno Setup not preinstalled, installing via choco..."
+            choco install innosetup -y --no-progress
           }
-          Write-Output "=== MeDVeD.exe summary ==="
-          if (Test-Path dist\MeDVeD.exe) {
-            Write-Output ("dist/MeDVeD.exe size: {0} MB" -f [math]::Round((Get-Item dist\MeDVeD.exe).Length/1MB,2))
-          } else {
-            throw "dist/MeDVeD.exe does not exist after pyinstaller"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after install attempt" }
+          & $iscc "/DMyAppVersion=$ver" MeDVeD.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compile failed (exit $LASTEXITCODE)" }
+          Get-ChildItem installer_output | ForEach-Object {
+            Write-Output ("installer: {0}  {1} MB" -f $_.Name, [math]::Round($_.Length/1MB,2))
+          }
+          if (-not (Test-Path "installer_output\MeDVeD-Setup-$ver.exe")) {
+            throw "installer_output\MeDVeD-Setup-$ver.exe not produced"
           }
 
       - name: Extract release notes for this tag from CHANGELOG.md
@@ -92,10 +110,10 @@ jobs:
           $out = Join-Path (Get-Location).Path "RELEASE_BODY.md"
           [System.IO.File]::WriteAllText($out, $body, (New-Object System.Text.UTF8Encoding($false)))
 
-      - name: Create GitHub Release with attached exe
+      - name: Create GitHub Release with attached installer
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MeDVeD.exe
+          files: installer_output/MeDVeD-Setup-*.exe
           body_path: RELEASE_BODY.md
           fail_on_unmatched_files: true
           generate_release_notes: false

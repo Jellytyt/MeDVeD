@@ -1,4 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
+# onedir build: the app ships as a folder (MeDVeD.exe + _internal\) instead of a
+# single self-extracting exe. At launch nothing is unpacked to a temp _MEI dir —
+# python313.dll and sing-box.exe sit on disk next to the exe and load directly.
+# That makes the "Failed to load Python DLL ... LoadLibrary" first-run race
+# (onefile self-extraction fighting the antivirus scan) physically impossible.
+# An Inno Setup installer (MeDVeD.iss) wraps this folder for distribution.
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = []
@@ -33,21 +39,28 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,   # onedir: deps go into _internal\, not into the exe
     name='MeDVeD',
     icon='assets/medved.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=['sing-box.exe'],
-    runtime_tmpdir=None,
+    upx=False,               # UPX packing also trips AV heuristics — drop it
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='MeDVeD',           # -> dist\MeDVeD\ (MeDVeD.exe + _internal\)
 )

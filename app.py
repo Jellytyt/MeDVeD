@@ -33,7 +33,7 @@ from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -3488,12 +3488,22 @@ class VlessApp(ctk.CTk):
         tag = str(data.get("tag_name", "")).strip()
         if not tag or _parse_version(tag) <= _parse_version(__version__):
             return False
+        # Prefer the Setup installer; fall back to any .exe (older releases that
+        # shipped a bare onefile exe).
         asset_url = ""
+        fallback_url = ""
         for asset in data.get("assets") or []:
             name = str(asset.get("name", "")).lower()
-            if name.endswith(".exe"):
-                asset_url = str(asset.get("browser_download_url", ""))
+            url = str(asset.get("browser_download_url", ""))
+            if not name.endswith(".exe"):
+                continue
+            if "setup" in name:
+                asset_url = url
                 break
+            if not fallback_url:
+                fallback_url = url
+        if not asset_url:
+            asset_url = fallback_url
         if not asset_url:
             return False
         self.after(0, self._on_update_available, tag.lstrip("vV"), asset_url)
@@ -3550,20 +3560,23 @@ class VlessApp(ctk.CTk):
 
     def _download_and_apply_update(self) -> None:
         tmp_dir = Path(tempfile.gettempdir())
-        target_exe = Path(sys.executable).resolve()
-        new_exe = tmp_dir / f"MeDVeD_new_{os.getpid()}.exe"
+        setup_exe = tmp_dir / f"MeDVeD_Setup_{os.getpid()}.exe"
 
         try:
             req = urllib.request.Request(self._update_url, headers={"User-Agent": f"MeDVeD/{__version__}"})
-            with urllib.request.urlopen(req, timeout=180) as resp, new_exe.open("wb") as out:
+            with urllib.request.urlopen(req, timeout=180) as resp, setup_exe.open("wb") as out:
                 shutil.copyfileobj(resp, out)
         except Exception as error:
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось скачать: {e}", "error"))
             return
 
-        # Write a real .ps1 file + run it with -File. Single-line -Command was
-        # flaky under DETACHED_PROCESS (script would silently skip Move-Item).
-        # Each step also writes to %TEMP%\MeDVeD_updater.log via PowerShell.
+        # The release asset is an Inno Setup installer (onedir app inside). A
+        # detached PowerShell helper waits for THIS process to exit (so the
+        # install folder is unlocked), then runs the installer silently. The
+        # installer replaces the folder in place and relaunches MeDVeD via its
+        # own [Run] entry. Nothing self-extracts to a temp _MEI dir, so the
+        # onefile "Failed to load Python DLL" first-run error cannot occur.
+        # Progress is logged to %TEMP%\MeDVeD_updater.log.
         log_path = tmp_dir / "MeDVeD_updater.log"
         ps_file = tmp_dir / f"MeDVeD_updater_{os.getpid()}.ps1"
         ps_script = (
@@ -3579,19 +3592,15 @@ class VlessApp(ctk.CTk):
             f"    \"PID already gone (ok): $_\" | Out-File -FilePath $logPath -Append\n"
             f"}}\n"
             f"Start-Sleep -Milliseconds 800\n"
+            f"\"Running installer silently...\" | Out-File -FilePath $logPath -Append\n"
             f"try {{\n"
-            f"    Move-Item -Force -Path '{new_exe}' -Destination '{target_exe}' -ErrorAction Stop\n"
-            f"    \"Move OK -> {target_exe}\" | Out-File -FilePath $logPath -Append\n"
+            f"    $p = Start-Process -FilePath '{setup_exe}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOCANCEL' -PassThru -Wait -ErrorAction Stop\n"
+            f"    \"Installer exit code: $($p.ExitCode)\" | Out-File -FilePath $logPath -Append\n"
             f"}} catch {{\n"
-            f"    \"Move FAILED: $_\" | Out-File -FilePath $logPath -Append\n"
-            f"    exit 1\n"
+            f"    \"Installer FAILED: $_\" | Out-File -FilePath $logPath -Append\n"
             f"}}\n"
-            f"try {{\n"
-            f"    Start-Process -FilePath '{target_exe}'\n"
-            f"    \"Start-Process OK\" | Out-File -FilePath $logPath -Append\n"
-            f"}} catch {{\n"
-            f"    \"Start FAILED: $_\" | Out-File -FilePath $logPath -Append\n"
-            f"}}\n"
+            f"Remove-Item -Force -Path '{setup_exe}' -ErrorAction SilentlyContinue\n"
+            f"Remove-Item -Force -Path '{ps_file}' -ErrorAction SilentlyContinue\n"
         )
         try:
             ps_file.write_text(ps_script, encoding="utf-8-sig")
@@ -3616,7 +3625,7 @@ class VlessApp(ctk.CTk):
             return
 
         # Give the OS time to actually create the PowerShell process before we
-        # tear our own window down. 500ms was sometimes not enough on cold systems.
+        # tear our own window down, then quit so the installer can replace files.
         self.after(2000, self._real_quit)
 
 
