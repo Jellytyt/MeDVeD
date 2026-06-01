@@ -68,22 +68,29 @@ jobs:
       - name: Extract release notes for this tag from CHANGELOG.md
         shell: powershell
         run: |
-          # Берём раздел "## vX.Y.Z" из CHANGELOG.md (от заголовка до следующего ## или EOF)
+          # Pull the "## vX.Y.Z" section from CHANGELOG.md (header to next ## or EOF).
+          # KEEP THIS SCRIPT ASCII-ONLY. GitHub writes the step to a temp file as
+          # UTF-8 without BOM, and Windows PowerShell 5.1 parses it as ANSI — any
+          # non-ASCII char here turns into mojibake and breaks the parser (that is
+          # exactly what made the v0.9.5 release build fail). The Cyrillic release
+          # notes themselves are fine: they come from CHANGELOG.md read at runtime,
+          # not from this script's own source.
           $tag = "${{ github.ref_name }}"
-          if (-not (Test-Path CHANGELOG.md)) {
-            "_(нет CHANGELOG.md)_" | Out-File -FilePath RELEASE_BODY.md -Encoding utf8
-            exit 0
+          $body = "Release $tag"
+          if (Test-Path CHANGELOG.md) {
+            $content = Get-Content CHANGELOG.md -Raw -Encoding UTF8
+            $pattern = "(?ms)^##\s+$([regex]::Escape($tag))\s*\r?\n(.*?)(?=^##\s+v|\z)"
+            $m = [regex]::Match($content, $pattern)
+            if ($m.Success) {
+              $body = $m.Groups[1].Value.Trim()
+              Write-Output "Release notes extracted for $tag ($($body.Length) chars)"
+            } else {
+              Write-Output "WARNING: no CHANGELOG section for $tag, using fallback body"
+            }
           }
-          $content = Get-Content CHANGELOG.md -Raw
-          $pattern = "(?ms)^##\s+$([regex]::Escape($tag))\s*\r?\n(.*?)(?=^##\s+v|\z)"
-          $m = [regex]::Match($content, $pattern)
-          if ($m.Success) {
-            $m.Groups[1].Value.Trim() | Out-File -FilePath RELEASE_BODY.md -Encoding utf8
-            Write-Output "Release notes extracted for $tag"
-          } else {
-            "_(в CHANGELOG.md нет раздела для $tag — добавь его перед следующим релизом)_" | Out-File -FilePath RELEASE_BODY.md -Encoding utf8
-            Write-Output "WARNING: no section for $tag in CHANGELOG.md"
-          }
+          # Write UTF-8 WITHOUT BOM so the release body has no stray leading char.
+          $out = Join-Path (Get-Location).Path "RELEASE_BODY.md"
+          [System.IO.File]::WriteAllText($out, $body, (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Create GitHub Release with attached exe
         uses: softprops/action-gh-release@v2
