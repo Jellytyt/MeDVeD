@@ -31,7 +31,11 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}/releases
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 UsePreviousAppDir=yes
-DisableDirPage=yes
+; Show the "Select Destination Location" page so the user can pick the install
+; folder. Default stays per-user (%LOCALAPPDATA%\Programs\MeDVeD). Silent
+; auto-updates pass /VERYSILENT, which skips this page and reuses the previous
+; install dir (UsePreviousAppDir=yes), so the chosen path persists across updates.
+DisableDirPage=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=installer_output

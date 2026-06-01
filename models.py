@@ -75,6 +75,19 @@ class VlessProfile:
         )
 
 
+def _coerce_int(value: Any, default: int) -> int:
+    """Parse an int from settings JSON, falling back to `default` on junk.
+
+    Unlike `int(value or default)`, this preserves an explicit 0 — e.g. a user
+    who turned subscription auto-refresh off. Only a missing key (handled by the
+    caller's `.get(..., default)`) or unparseable junk falls back.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class AppSettings:
     sing_box_path: str = "sing-box"
@@ -83,7 +96,7 @@ class AppSettings:
     auto_connect_enabled: bool = False
     auto_connect_key: str = ""
     minimize_to_tray: bool = True
-    subscription_refresh_hours: int = 0
+    subscription_refresh_hours: int = 1
     notifications_enabled: bool = True
     bypass_ru: bool = False
     kill_switch: bool = False
@@ -112,7 +125,7 @@ class AppSettings:
             auto_connect_enabled=bool(data.get("auto_connect_enabled", False)),
             auto_connect_key=str(data.get("auto_connect_key", "")),
             minimize_to_tray=bool(data.get("minimize_to_tray", True)),
-            subscription_refresh_hours=int(data.get("subscription_refresh_hours", 0) or 0),
+            subscription_refresh_hours=_coerce_int(data.get("subscription_refresh_hours", 1), 1),
             notifications_enabled=bool(data.get("notifications_enabled", True)),
             bypass_ru=bool(data.get("bypass_ru", False)),
             kill_switch=bool(data.get("kill_switch", False)),

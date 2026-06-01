@@ -33,7 +33,7 @@ from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
