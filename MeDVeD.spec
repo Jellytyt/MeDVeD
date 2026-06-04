@@ -19,6 +19,7 @@ datas += [
     ('assets/medved.ico', 'assets'),
     ('assets/medved_active.png', 'assets'),
     ('assets/medved_inactive.png', 'assets'),
+    ('CHANGELOG.md', '.'),  # read at runtime for the "What's new" dialog
 ]
 
 a = Analysis(

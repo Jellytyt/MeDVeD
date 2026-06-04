@@ -29,22 +29,32 @@ jobs:
           pip install pyinstaller
           pip install -r requirements.txt
 
-      - name: Download sing-box.exe (latest stable for windows-amd64)
+      - name: Download sing-box.exe (PINNED version for windows-amd64)
         shell: powershell
+        env:
+          # Pinned for reproducible builds. To bump: change this, rebuild, run the
+          # app against real servers (sing-box can break configs between versions
+          # — see the 1.13 migration), THEN tag a release. Never auto-track latest.
+          SINGBOX_VERSION: "1.13.12"
         run: |
           $ErrorActionPreference = 'Stop'
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/latest" -Headers @{ "User-Agent" = "MeDVeD-CI" }
+          $ver = $env:SINGBOX_VERSION
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v$ver" -Headers @{ "User-Agent" = "MeDVeD-CI" }
           $asset = $release.assets | Where-Object { $_.name -match "windows-amd64.*\.zip$" } | Select-Object -First 1
-          if (-not $asset) { throw "No windows-amd64 zip found in sing-box latest release" }
-          Write-Output "Downloading $($asset.name)"
+          if (-not $asset) { throw "No windows-amd64 zip found in sing-box v$ver" }
+          Write-Output "Downloading $($asset.name) (pinned v$ver)"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile sing-box.zip
           Expand-Archive sing-box.zip -DestinationPath sing-box-extract
           $exePath = Get-ChildItem -Path sing-box-extract -Recurse -Filter "sing-box.exe" | Select-Object -First 1
           if (-not $exePath) { throw "sing-box.exe not found in archive" }
           Copy-Item $exePath.FullName -Destination .\sing-box.exe -Force
-          Write-Output "sing-box.exe size: $((Get-Item sing-box.exe).Length) bytes"
+          # Verify the bundled binary actually reports the pinned version.
+          $line = (& .\sing-box.exe version | Select-String -Pattern 'sing-box version (\S+)')
+          $reported = $line.Matches.Groups[1].Value
+          Write-Output "sing-box.exe reports: $reported ($((Get-Item sing-box.exe).Length) bytes)"
+          if ($reported -ne $ver) { throw "sing-box version mismatch: expected $ver, got $reported" }
 
-      - name: Build MeDVeD.exe
+      - name: Build onedir (PyInstaller)
         run: pyinstaller --noconfirm MeDVeD.spec
 
       - name: Verify onedir build
@@ -79,9 +89,21 @@ jobs:
           Get-ChildItem installer_output | ForEach-Object {
             Write-Output ("installer: {0}  {1} MB" -f $_.Name, [math]::Round($_.Length/1MB,2))
           }
-          if (-not (Test-Path "installer_output\MeDVeD-Setup-$ver.exe")) {
-            throw "installer_output\MeDVeD-Setup-$ver.exe not produced"
+          $setup = "installer_output\MeDVeD-Setup-$ver.exe"
+          if (-not (Test-Path $setup)) {
+            throw "$setup not produced"
           }
+          # Publish a SHA-256 checksum next to the installer. The auto-updater
+          # verifies it before running the downloaded installer (defence against
+          # a corrupted/tampered download), and users can verify manually.
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          $checksumLine = "$hash  MeDVeD-Setup-$ver.exe"
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location).Path "$setup.sha256"),
+            "$checksumLine`n",
+            (New-Object System.Text.ASCIIEncoding)
+          )
+          Write-Output "sha256: $hash"
 
       - name: Extract release notes for this tag from CHANGELOG.md
         shell: powershell
@@ -113,7 +135,9 @@ jobs:
       - name: Create GitHub Release with attached installer
         uses: softprops/action-gh-release@v2
         with:
-          files: installer_output/MeDVeD-Setup-*.exe
+          files: |
+            installer_output/MeDVeD-Setup-*.exe
+            installer_output/MeDVeD-Setup-*.exe.sha256
           body_path: RELEASE_BODY.md
           fail_on_unmatched_files: true
           generate_release_notes: false

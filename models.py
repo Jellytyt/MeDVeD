@@ -105,6 +105,7 @@ class AppSettings:
     start_minimized: bool = False
     appearance_mode: str = "dark"
     language: str = "ru"
+    last_seen_version: str = ""
     subscription_info: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     process_rules: List[Dict[str, str]] = field(default_factory=list)
     routing_rules: List[Dict[str, str]] = field(default_factory=list)
@@ -134,6 +135,7 @@ class AppSettings:
             start_minimized=bool(data.get("start_minimized", False)),
             appearance_mode=str(data.get("appearance_mode", "dark")),
             language=str(data.get("language", "ru")),
+            last_seen_version=str(data.get("last_seen_version", "")),
             subscription_info={
                 str(k): dict(v) for k, v in (data.get("subscription_info") or {}).items()
                 if isinstance(v, dict)

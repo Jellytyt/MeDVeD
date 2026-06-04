@@ -1,0 +1,3 @@
+# Dev/test-only dependencies (not bundled into the app).
+-r requirements.txt
+pytest>=8.0

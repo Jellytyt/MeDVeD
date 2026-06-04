@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import binascii
 import ctypes
+import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -33,7 +35,7 @@ from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -270,39 +272,21 @@ def _tcp_ping(host: str, port: int, timeout: float = 3.0) -> Optional[float]:
         return None
 
 
-def _tls_ping(host: str, port: int, server_name: str = "", timeout: float = 5.0) -> Optional[float]:
-    """One full TCP+TLS handshake, returns elapsed ms. This is the same kind
-    of measurement Karing/clients show as 'ping' — it captures the real cost
-    of opening a working connection to the VLESS endpoint (sub-1ms results
-    from raw TCP ping are misleading because they skip the TLS roundtrip)."""
-    if not host or port <= 0:
-        return None
-    import ssl
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        start = time.perf_counter()
-        with socket.create_connection((host, port), timeout=timeout) as raw:
-            with ctx.wrap_socket(raw, server_hostname=server_name or host) as ssock:
-                ssock.do_handshake()
-                return (time.perf_counter() - start) * 1000.0
-    except (OSError, socket.timeout, ssl.SSLError):
-        return None
+def _ping_avg(host: str, port: int, attempts: int = 3, pause: float = 0.2) -> Optional[float]:
+    """Server 'ping' for the profile list: a single TCP round-trip to the
+    server, averaged across a few attempts with the slowest outlier dropped
+    (the first attempt also pays DNS resolution, which the outlier drop hides).
 
-
-def _ping_avg(host: str, port: int, server_name: str = "", attempts: int = 3, pause: float = 0.2) -> Optional[float]:
-    """Preferred ping: TCP+TLS handshake time, averaged across several attempts
-    with the slowest outlier dropped. This matches what clients like Karing
-    show as the server's 'ping' — a realistic 50–200ms range for normal
-    overseas servers, not the unrealistic sub-1ms numbers a raw TCP-only or
-    ICMP probe can produce. Falls back to plain TCP if TLS handshake fails
-    (server may not be TLS or may reject our handshake)."""
+    This is a 1-RTT, steady-state-ish latency to the server — roughly what
+    Karing / sing-box show via their URLTest 'delay'. We deliberately do NOT
+    add the full TLS handshake: that is ~2 round-trips and reads ~2x higher,
+    which is honest about connection-setup cost but isn't the number users
+    compare against. The exact through-tunnel delay for the ACTIVE server is
+    still shown separately in the main 'Пинг:' field via the Clash API.
+    """
     samples: List[float] = []
     for i in range(attempts):
-        value = _tls_ping(host, port, server_name)
-        if value is None:
-            value = _tcp_ping(host, port)
+        value = _tcp_ping(host, port)
         if value is not None:
             samples.append(value)
         if i < attempts - 1:
@@ -311,7 +295,7 @@ def _ping_avg(host: str, port: int, server_name: str = "", attempts: int = 3, pa
         return None
     samples.sort()
     if len(samples) >= 3:
-        samples = samples[:-1]  # drop slowest outlier
+        samples = samples[:-1]  # drop slowest outlier (often the DNS-warmup one)
     mid = len(samples) // 2
     if len(samples) % 2 == 1:
         return samples[mid]
@@ -528,6 +512,39 @@ def _asset_path(name: str) -> Path:
     return Path(__file__).resolve().parent / "assets" / name
 
 
+def _changelog_path() -> Optional[Path]:
+    """Locate the bundled CHANGELOG.md (dev tree or frozen onedir)."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "CHANGELOG.md")
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "CHANGELOG.md")
+        candidates.append(exe_dir / "_internal" / "CHANGELOG.md")
+    else:
+        candidates.append(Path(__file__).resolve().parent / "CHANGELOG.md")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _read_changelog_section(version: str) -> str:
+    """Return the body of the '## vX.Y.Z' section from CHANGELOG.md, or ''.
+    Same section-extraction logic the release CI uses, but at runtime."""
+    path = _changelog_path()
+    if path is None:
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    tag = re.escape("v" + version.lstrip("vV"))
+    match = re.search(rf"(?ms)^##\s+{tag}\s*\r?\n(.*?)(?=^##\s+v|\Z)", text)
+    return match.group(1).strip() if match else ""
+
+
 def _is_admin() -> bool:
     if os.name != "nt":
         return os.geteuid() == 0 if hasattr(os, "geteuid") else False
@@ -664,6 +681,8 @@ class VlessApp(ctk.CTk):
         self._update_available = False
         self._update_version = ""
         self._update_url = ""
+        self._update_sha256 = ""
+        self._update_sha256_url = ""
         self._update_badge: Optional[Any] = None
         self._log_buffer: deque = deque(maxlen=500)
         self.log_widget: Optional[Any] = None
@@ -716,6 +735,7 @@ class VlessApp(ctk.CTk):
         if self.settings.auto_connect_enabled and self.settings.auto_connect_key:
             self.after(500, self._safe_auto_connect_startup)
         self._schedule_subscription_refresh()
+        self.after(2000, self._maybe_show_whats_new)
         if getattr(sys, "frozen", False) and not GITHUB_REPO.startswith("USERNAME/"):
             self.after(5000, lambda: threading.Thread(target=self._check_for_update, daemon=True).start())
 
@@ -815,27 +835,96 @@ class VlessApp(ctk.CTk):
         self._build_profiles_view()
         self._build_log_view()
 
+        self._view_anim_id: Optional[str] = None
         self.current_view = "main"
-        self._show_view("main")
+        self._show_view("main", animate=False)
 
-    def _show_view(self, name: str) -> None:
+    _VIEW_SLIDE_STEPS = 12
+    _VIEW_SLIDE_MS = 12
+
+    def _show_view(self, name: str, animate: bool = True) -> None:
         # Close any open dropdowns before switching screens — they're placed on
         # the root window so wouldn't disappear with the view.
         self._hide_burger()
         self._hide_server_menu()
-        for v in self._views.values():
-            v.pack_forget()
+        # Cancel any in-flight slide so fast clicking can't strand a half-placed
+        # view or stack overlapping animations.
+        if self._view_anim_id is not None:
+            try:
+                self.after_cancel(self._view_anim_id)
+            except Exception:
+                pass
+            self._view_anim_id = None
         view = self._views.get(name)
         if view is None:
             return
-        view.pack(fill=BOTH, expand=True)
+        prev_view = self.current_view
         self.current_view = name
+
+        # Views are managed with place() (NOT pack): the incoming view is placed
+        # ON TOP of the outgoing one, then the others are hidden only once they're
+        # fully covered. So the container is never momentarily empty, and we never
+        # do a place->pack handoff — both of which caused a full-window redraw
+        # flash at the end of the slide. Direction: deeper (main->sub) enters from
+        # the right, back (sub->main) from the left.
+        direction = (-1 if name == "main" else 1) if (animate and prev_view != name) else 0
+        if direction == 0:
+            view.place(x=0, y=0, relwidth=1, relheight=1)
+            view.lift()
+            self._hide_other_views(view)
+        else:
+            self._animate_view_in(view, direction)
+
         if name == "log" and self.log_widget is not None:
             try:
                 self.log_widget.see(END)
             except Exception:
                 pass
         self._render_update_badge()
+
+    def _hide_other_views(self, keep: Any) -> None:
+        for v in self._views.values():
+            if v is keep:
+                continue
+            try:
+                v.place_forget()
+            except Exception:
+                pass
+            try:
+                v.pack_forget()
+            except Exception:
+                pass
+
+    def _animate_view_in(self, view: Any, direction: int) -> None:
+        """Slide `view` in from the side via place(), riding on top of the
+        outgoing view; hide the rest only once it's fully covered. The view
+        stays place-managed afterwards (no pack handoff). ease-out, ~150ms."""
+        width = self.view_container.winfo_width()
+        if width <= 1:
+            width = self.winfo_width()
+        if width <= 1:  # size unknown — show instantly
+            view.place(x=0, y=0, relwidth=1, relheight=1)
+            view.lift()
+            self._hide_other_views(view)
+            return
+        view.lift()  # incoming view rides above the outgoing one during the slide
+
+        def step(i: int) -> None:
+            if not view.winfo_exists():
+                self._view_anim_id = None
+                return
+            if i >= self._VIEW_SLIDE_STEPS:
+                view.place(x=0, y=0, relwidth=1, relheight=1)
+                self._hide_other_views(view)  # covered now — safe to drop
+                self._view_anim_id = None
+                return
+            frac = i / self._VIEW_SLIDE_STEPS
+            eased = 1 - (1 - frac) ** 3
+            offset = int(direction * width * (1 - eased))
+            view.place(x=offset, y=0, relwidth=1, relheight=1)
+            self._view_anim_id = self.after(self._VIEW_SLIDE_MS, lambda: step(i + 1))
+
+        step(0)
 
     def _view_header(self, parent, title: str, back: bool = False) -> "ctk.CTkFrame":
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2563,7 +2652,11 @@ class VlessApp(ctk.CTk):
 
     def _build_log_view(self) -> None:
         view = ctk.CTkFrame(self.view_container, fg_color="transparent")
-        self._view_header(view, "Журнал", back=True)
+        header = self._view_header(view, "Журнал", back=True)
+        ctk.CTkButton(
+            header, text="🩺 Скопировать диагностику", command=self._copy_diagnostics,
+            height=32, fg_color="#2b2b2b", hover_color="#3a3a3a",
+        ).pack(side=RIGHT)
 
         wrapper = ctk.CTkFrame(view, fg_color="transparent")
         wrapper.pack(fill=BOTH, expand=True, padx=16, pady=(0, 16))
@@ -3306,15 +3399,11 @@ class VlessApp(ctk.CTk):
         if not self.profiles:
             self._show_toast("MeDVeD", "Нет профилей для проверки.", "info")
             return
-        self.log(f"Проверка пинга {len(self.profiles)} профилей (TLS handshake, параллельно)...")
+        self.log(f"Проверка пинга {len(self.profiles)} профилей (1-RTT TCP, параллельно)...")
         snapshot = list(self.profiles)
 
         def probe(profile: VlessProfile) -> None:
-            ping_ms = _ping_avg(
-                profile.server, profile.port,
-                server_name=profile.sni or profile.server,
-                attempts=3,
-            )
+            ping_ms = _ping_avg(profile.server, profile.port, attempts=3)
             key = self._profile_ping_key(profile)
             self.after(0, self._set_profile_ping, key, ping_ms)
 
@@ -3489,30 +3578,45 @@ class VlessApp(ctk.CTk):
         if not tag or _parse_version(tag) <= _parse_version(__version__):
             return False
         # Prefer the Setup installer; fall back to any .exe (older releases that
-        # shipped a bare onefile exe).
+        # shipped a bare onefile exe). Also capture the SHA-256 — from the asset's
+        # API digest field when present, plus the standalone .sha256 asset URL as
+        # a fallback — so the updater can verify the download before running it.
+        # Full pass (no early break) so the .sha256 asset is seen regardless of
+        # the order assets appear in the API response.
         asset_url = ""
         fallback_url = ""
+        sha256_digest = ""
+        fallback_digest = ""
+        sha256_url = ""
         for asset in data.get("assets") or []:
             name = str(asset.get("name", "")).lower()
             url = str(asset.get("browser_download_url", ""))
-            if not name.endswith(".exe"):
-                continue
-            if "setup" in name:
-                asset_url = url
-                break
-            if not fallback_url:
-                fallback_url = url
+            digest = str(asset.get("digest", "") or "")
+            parsed_digest = digest.split("sha256:", 1)[1].strip() if "sha256:" in digest else ""
+            if name.endswith(".sha256"):
+                sha256_url = url
+            elif name.endswith(".exe"):
+                if "setup" in name:
+                    asset_url = url
+                    sha256_digest = parsed_digest
+                elif not fallback_url:
+                    fallback_url = url
+                    fallback_digest = parsed_digest
         if not asset_url:
             asset_url = fallback_url
+            sha256_digest = fallback_digest
         if not asset_url:
             return False
-        self.after(0, self._on_update_available, tag.lstrip("vV"), asset_url)
+        self.after(0, self._on_update_available, tag.lstrip("vV"), asset_url, sha256_digest, sha256_url)
         return True
 
-    def _on_update_available(self, version: str, asset_url: str) -> None:
+    def _on_update_available(self, version: str, asset_url: str,
+                             sha256: str = "", sha256_url: str = "") -> None:
         self._update_available = True
         self._update_version = version
         self._update_url = asset_url
+        self._update_sha256 = sha256
+        self._update_sha256_url = sha256_url
         self.log(f"Доступно обновление: {version}")
         self._render_update_badge()
 
@@ -3541,6 +3645,207 @@ class VlessApp(ctk.CTk):
         except Exception:
             pass
 
+    def _maybe_show_whats_new(self) -> None:
+        """After an auto-update relaunches the app, show the CHANGELOG section
+        for the new version once. Records the version in settings so it appears
+        only on a real version bump — never on a fresh install."""
+        last = (self.settings.last_seen_version or "").strip()
+        is_update = bool(last) and _parse_version(last) < _parse_version(__version__)
+        if not is_update:
+            if self.settings.last_seen_version != __version__:
+                self.settings.last_seen_version = __version__
+                try:
+                    save_settings(self.settings)
+                except Exception:
+                    pass
+            return
+        if not self.winfo_viewable():
+            return  # started hidden in tray; retry next time the window is open
+        notes = _read_changelog_section(__version__)
+        self._show_whats_new(__version__, notes or f"Обновлено до версии {__version__}.")
+        self.settings.last_seen_version = __version__
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _show_whats_new(self, version: str, notes: str) -> None:
+        def build_body(card: "ctk.CTkFrame") -> None:
+            box = ScrolledText(
+                card, width=58, height=18, wrap="word", relief="flat",
+                bd=0, padx=12, pady=8, cursor="arrow",
+                bg="#2b2b2b", fg="#e0e0e0", insertbackground="#e0e0e0",
+                font=("Segoe UI", 10), highlightthickness=0,
+            )
+            box.pack(fill=BOTH, expand=True, padx=16, pady=(0, 8))
+            self._render_markdown(box, notes)
+            box.configure(state="disabled")
+        self._show_overlay(f"🎉 Что нового в v{version}", build_body,
+                           [("Отлично", None, "primary")], accent="ok")
+
+    def _render_markdown(self, box: "ScrolledText", md: str) -> None:
+        """Light Markdown rendering for CHANGELOG sections: ## / ### headers,
+        '- ' bullets (one nesting level), **bold** and `code` inline."""
+        box.tag_configure("h", font=("Segoe UI Semibold", 12, "bold"),
+                          foreground="#5aa9e6", spacing1=10, spacing3=4)
+        box.tag_configure("bullet", lmargin1=16, lmargin2=30, spacing3=3)
+        box.tag_configure("bullet2", lmargin1=38, lmargin2=52, spacing3=3)
+        box.tag_configure("bold", font=("Segoe UI", 10, "bold"))
+        box.tag_configure("code", font=("Consolas", 10), foreground="#d7b36b")
+        for raw in md.splitlines():
+            stripped = raw.strip()
+            if not stripped:
+                box.insert("end", "\n")
+                continue
+            if stripped.startswith("### "):
+                box.insert("end", stripped[4:] + "\n", ("h",))
+                continue
+            if stripped.startswith("## "):
+                box.insert("end", stripped[3:] + "\n", ("h",))
+                continue
+            if stripped.startswith("- "):
+                indent = len(raw) - len(raw.lstrip())
+                tag = "bullet2" if indent >= 2 else "bullet"
+                box.insert("end", "•  ", (tag,))
+                self._insert_inline(box, stripped[2:], (tag,))
+                box.insert("end", "\n")
+                continue
+            self._insert_inline(box, stripped, ())
+            box.insert("end", "\n")
+
+    def _insert_inline(self, box: "ScrolledText", text: str, base_tags: tuple) -> None:
+        """Insert a line, styling **bold** and `code` spans."""
+        pos = 0
+        for match in re.finditer(r"\*\*(.+?)\*\*|`([^`]+)`", text):
+            if match.start() > pos:
+                box.insert("end", text[pos:match.start()], base_tags)
+            if match.group(1) is not None:
+                box.insert("end", match.group(1), base_tags + ("bold",))
+            else:
+                box.insert("end", match.group(2), base_tags + ("code",))
+            pos = match.end()
+        if pos < len(text):
+            box.insert("end", text[pos:], base_tags)
+
+    def _copy_diagnostics(self) -> None:
+        """Copy a non-sensitive diagnostics blob (versions, environment, recent
+        log tail) to the clipboard for bug reports. Deliberately omits secrets:
+        no subscription URLs, UUIDs, passwords or server addresses — only counts
+        and the app.log tail (which the README already asks users to attach)."""
+        lines = [f"MeDVeD: v{__version__} (frozen={getattr(sys, 'frozen', False)})"]
+        try:
+            lines.append(f"OS: {platform.platform()}")
+        except Exception:
+            pass
+        lines.append(f"admin: {_is_admin()}")
+        try:
+            lines.append(f"exe: {Path(sys.executable).resolve()}")
+        except Exception:
+            pass
+
+        sb_path = ""
+        sb_ver = "?"
+        try:
+            sb = self._find_sing_box_path(self.settings.sing_box_path)
+            if sb is not None:
+                sb_path = str(sb)
+                proc = subprocess.run(
+                    [sb_path, "version"], capture_output=True, text=True, timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                first = (proc.stdout or proc.stderr or "").splitlines()
+                sb_ver = first[0].strip() if first else "?"
+        except Exception:
+            pass
+        lines.append(f"sing-box: {sb_ver}")
+        if sb_path:
+            lines.append(f"sing-box path: {sb_path}")
+
+        lines.append(f"profiles: {len(self.profiles)}; subscriptions: {len(self.settings.subscriptions)}")
+        s = self.settings
+        lines.append(
+            "settings: "
+            f"bypass_ru={s.bypass_ru}, kill_switch={s.kill_switch}, "
+            f"urltest={s.urltest_auto_switch}, autostart={s.auto_start_with_windows}, "
+            f"min_to_tray={s.minimize_to_tray}, refresh_h={s.subscription_refresh_hours}, "
+            f"theme={s.appearance_mode}, lang={s.language}"
+        )
+
+        log_tail = ""
+        try:
+            log_path = get_user_data_root() / "app.log"
+            if log_path.is_file():
+                content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                log_tail = "\n".join(content[-60:])
+        except Exception:
+            pass
+
+        blob = "=== MeDVeD diagnostics ===\n" + "\n".join(lines)
+        if log_tail:
+            blob += "\n\n=== app.log (last 60 lines) ===\n" + log_tail
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(blob)
+            self._show_snackbar("Диагностика скопирована в буфер обмена", "ok", duration_ms=3000)
+        except Exception:
+            self._show_toast("Диагностика", "Не удалось скопировать в буфер обмена.", "error")
+
+    def _show_download_progress(self) -> None:
+        """Bottom-of-window progress bar shown while the update installer
+        downloads (25 MB+), so a click on 'Обновить' isn't a silent freeze."""
+        existing = getattr(self, "_dl_bar", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except Exception:
+                pass
+        bar = ctk.CTkFrame(self, fg_color="#252525", corner_radius=10,
+                           border_width=1, border_color="#3a3a3a")
+        self._dl_label = ctk.CTkLabel(
+            bar, text="Скачивание обновления…",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#e0e0e0")
+        self._dl_label.pack(padx=20, pady=(10, 4))
+        self._dl_progress = ctk.CTkProgressBar(bar, width=320, height=10)
+        self._dl_progress.set(0)
+        self._dl_progress.pack(padx=20, pady=(0, 12))
+        bar.place(relx=0.5, rely=0.9, anchor="center")
+        bar.lift()
+        self._dl_bar = bar
+
+    def _update_download_progress(self, downloaded: int, total: int) -> None:
+        if getattr(self, "_dl_bar", None) is None:
+            return
+        mb = downloaded / (1024 * 1024)
+        try:
+            if total and total > 0:
+                frac = max(0.0, min(1.0, downloaded / total))
+                self._dl_progress.set(frac)
+                self._dl_label.configure(
+                    text=f"Скачивание обновления: {int(frac * 100)}% · "
+                         f"{mb:.1f} / {total / (1024 * 1024):.1f} МБ")
+            else:
+                self._dl_label.configure(text=f"Скачивание обновления: {mb:.1f} МБ")
+        except Exception:
+            pass
+
+    def _mark_update_installing(self) -> None:
+        if getattr(self, "_dl_bar", None) is None:
+            return
+        try:
+            self._dl_progress.set(1.0)
+            self._dl_label.configure(text="Устанавливаю обновление…")
+        except Exception:
+            pass
+
+    def _close_download_progress(self) -> None:
+        bar = getattr(self, "_dl_bar", None)
+        if bar is not None:
+            try:
+                bar.destroy()
+            except Exception:
+                pass
+        self._dl_bar = None
+
     def _start_update_flow(self) -> None:
         if not self._update_url:
             return
@@ -3555,20 +3860,94 @@ class VlessApp(ctk.CTk):
         if not getattr(sys, "frozen", False):
             self._show_toast("Обновление", "Авто-обновление доступно только в собранном exe.", "warn")
             return
-        self._show_snackbar("Скачиваю обновление…", "info", duration_ms=4000)
+        self._show_download_progress()
         threading.Thread(target=self._download_and_apply_update, daemon=True).start()
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest().lower()
 
     def _download_and_apply_update(self) -> None:
         tmp_dir = Path(tempfile.gettempdir())
         setup_exe = tmp_dir / f"MeDVeD_Setup_{os.getpid()}.exe"
 
+        expected_size = None
         try:
             req = urllib.request.Request(self._update_url, headers={"User-Agent": f"MeDVeD/{__version__}"})
-            with urllib.request.urlopen(req, timeout=180) as resp, setup_exe.open("wb") as out:
-                shutil.copyfileobj(resp, out)
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                cl = resp.headers.get("Content-Length")
+                if cl and cl.strip().isdigit():
+                    expected_size = int(cl)
+                with setup_exe.open("wb") as out:
+                    downloaded = 0
+                    last_emit = 0.0
+                    while True:
+                        chunk = resp.read(262144)  # 256 KiB
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.monotonic()
+                        if now - last_emit >= 0.1:  # throttle UI updates to ~10 fps
+                            last_emit = now
+                            self.after(0, self._update_download_progress, downloaded, expected_size or 0)
+                    self.after(0, self._update_download_progress, downloaded, expected_size or 0)
         except Exception as error:
+            self.after(0, self._close_download_progress)
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось скачать: {e}", "error"))
             return
+
+        # Guard against a truncated/empty download BEFORE we quit and hand off to
+        # the installer. Otherwise a corrupt Setup.exe would just fail silently
+        # after the app already closed — better to stay open and report it.
+        actual_size = setup_exe.stat().st_size if setup_exe.exists() else 0
+        if actual_size == 0 or (expected_size is not None and actual_size != expected_size):
+            try:
+                setup_exe.unlink()
+            except OSError:
+                pass
+            self.after(0, self._close_download_progress)
+            self.after(0, lambda: self._show_toast(
+                "Обновление", "Загрузка повреждена (неполный файл). Попробуй ещё раз.", "error"))
+            return
+
+        # Verify SHA-256 before running the installer. Expected hash comes from
+        # the GitHub API asset digest, or a downloaded .sha256 asset. If neither
+        # is available (older release), fall back to the size check above. This
+        # is defence-in-depth against a corrupted/tampered download — it is NOT a
+        # substitute for code signing (an attacker who can swap the binary on the
+        # release could swap the checksum too); it does catch truncation, CDN
+        # corruption and a bad upload, and any tamper that didn't update both.
+        expected_hash = (self._update_sha256 or "").strip().lower()
+        if not expected_hash and self._update_sha256_url:
+            try:
+                req2 = urllib.request.Request(
+                    self._update_sha256_url, headers={"User-Agent": f"MeDVeD/{__version__}"})
+                with urllib.request.urlopen(req2, timeout=30) as resp2:
+                    expected_hash = resp2.read().decode("utf-8", "replace").split()[0].strip().lower()
+            except Exception:
+                expected_hash = ""
+        if expected_hash:
+            actual_hash = self._sha256_file(setup_exe)
+            if actual_hash != expected_hash:
+                try:
+                    setup_exe.unlink()
+                except OSError:
+                    pass
+                self.log(f"Обновление: SHA-256 mismatch (want {expected_hash[:12]}…, got {actual_hash[:12]}…)")
+                self.after(0, self._close_download_progress)
+                self.after(0, lambda: self._show_toast(
+                    "Обновление",
+                    "Контрольная сумма не совпала — файл повреждён или подменён. Установка отменена.",
+                    "error"))
+                return
+            self.log("Обновление: SHA-256 проверен — ок")
+        else:
+            self.log("Обновление: SHA-256 недоступен, пропускаю проверку (есть проверка размера)")
 
         # The release asset is an Inno Setup installer (onedir app inside). A
         # detached PowerShell helper waits for THIS process to exit (so the
@@ -3579,9 +3958,15 @@ class VlessApp(ctk.CTk):
         # Progress is logged to %TEMP%\MeDVeD_updater.log.
         log_path = tmp_dir / "MeDVeD_updater.log"
         ps_file = tmp_dir / f"MeDVeD_updater_{os.getpid()}.ps1"
+        # Escape single quotes for embedding inside PowerShell single-quoted
+        # literals — a Windows username with an apostrophe (C:\Users\O'Brien\...)
+        # would otherwise terminate the string and break the helper. '  ->  ''
+        setup_lit = str(setup_exe).replace("'", "''")
+        log_lit = str(log_path).replace("'", "''")
+        ps_lit = str(ps_file).replace("'", "''")
         ps_script = (
             f"$ErrorActionPreference = 'SilentlyContinue'\n"
-            f"$logPath = '{log_path}'\n"
+            f"$logPath = '{log_lit}'\n"
             f"\"=== updater start $(Get-Date) ===\" | Out-File -FilePath $logPath -Append\n"
             f"\"Waiting for PID {os.getpid()} to exit...\" | Out-File -FilePath $logPath -Append\n"
             f"try {{\n"
@@ -3594,17 +3979,18 @@ class VlessApp(ctk.CTk):
             f"Start-Sleep -Milliseconds 800\n"
             f"\"Running installer silently...\" | Out-File -FilePath $logPath -Append\n"
             f"try {{\n"
-            f"    $p = Start-Process -FilePath '{setup_exe}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOCANCEL' -PassThru -Wait -ErrorAction Stop\n"
+            f"    $p = Start-Process -FilePath '{setup_lit}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOCANCEL' -PassThru -Wait -ErrorAction Stop\n"
             f"    \"Installer exit code: $($p.ExitCode)\" | Out-File -FilePath $logPath -Append\n"
             f"}} catch {{\n"
             f"    \"Installer FAILED: $_\" | Out-File -FilePath $logPath -Append\n"
             f"}}\n"
-            f"Remove-Item -Force -Path '{setup_exe}' -ErrorAction SilentlyContinue\n"
-            f"Remove-Item -Force -Path '{ps_file}' -ErrorAction SilentlyContinue\n"
+            f"Remove-Item -Force -Path '{setup_lit}' -ErrorAction SilentlyContinue\n"
+            f"Remove-Item -Force -Path '{ps_lit}' -ErrorAction SilentlyContinue\n"
         )
         try:
             ps_file.write_text(ps_script, encoding="utf-8-sig")
         except Exception as error:
+            self.after(0, self._close_download_progress)
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось подготовить установщик: {e}", "error"))
             return
 
@@ -3621,11 +4007,13 @@ class VlessApp(ctk.CTk):
                 close_fds=False,
             )
         except Exception as error:
+            self.after(0, self._close_download_progress)
             self.after(0, lambda e=error: self._show_toast("Обновление", f"Не удалось запустить установщик: {e}", "error"))
             return
 
         # Give the OS time to actually create the PowerShell process before we
         # tear our own window down, then quit so the installer can replace files.
+        self.after(0, self._mark_update_installing)
         self.after(2000, self._real_quit)
 
 
