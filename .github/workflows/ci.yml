@@ -26,8 +26,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run unit tests
-        run: python -m pytest
+      - name: Run unit tests with coverage
+        # Coverage is scoped to the pure-logic modules (parser/config/models/
+        # storage) — the GUI/OS-integration code in app.py is covered by the
+        # import smoke below plus the manual SMOKE_CHECKLIST.md, not unit tests.
+        # fail-under guards against a regression silently dropping coverage; it
+        # sits well below the current ~99% so honest refactors don't trip it.
+        run: >
+          python -m pytest
+          --cov=parser --cov=config --cov=models --cov=storage --cov=flags
+          --cov-report=term-missing --cov-fail-under=90
 
       - name: Import smoke (whole import graph resolves)
         run: python -c "import app, parser, config, models, storage; print('import OK', app.__version__)"

@@ -7,7 +7,13 @@ was the hardest-won fix of the routing work.
 import pytest
 
 from models import VlessProfile
-from config import build_sing_box_config
+from config import (
+    build_sing_box_config,
+    _build_tls,
+    _build_transport,
+    _split_csv,
+    _prune_none_values,
+)
 
 
 def _profile(name="S", protocol="vless", **kw):
@@ -90,3 +96,212 @@ def test_process_and_routing_rules_injected():
     rules = cfg["route"]["rules"]
     assert {"process_name": "telegram.exe", "outbound": "proxy"} in rules
     assert {"domain_suffix": "example.org", "action": "reject"} in rules
+
+
+# --- TLS block ----------------------------------------------------------------
+
+def test_tls_reality_block():
+    tls = _build_tls(_profile(security="reality", public_key="PK", short_id="ab", fp="firefox"))
+    assert tls["enabled"] is True
+    assert tls["server_name"] == "srv.example.com"   # falls back to server
+    assert tls["utls"] == {"enabled": True, "fingerprint": "firefox"}
+    assert tls["reality"] == {"enabled": True, "public_key": "PK", "short_id": "ab"}
+
+
+def test_tls_standard_has_utls_and_split_alpn():
+    tls = _build_tls(_profile(security="tls", sni="sni.example.com", fp="", alpn="h2,http/1.1"))
+    assert tls["server_name"] == "sni.example.com"
+    assert tls["utls"]["fingerprint"] == "chrome"     # empty fp -> default
+    assert tls["alpn"] == ["h2", "http/1.1"]
+
+
+def test_tls_none_is_disabled():
+    assert _build_tls(_profile(security="none")) == {"enabled": False}
+
+
+# --- transport block ----------------------------------------------------------
+
+def test_transport_ws_with_path_and_host():
+    t = _build_transport(_profile(type="ws", path="/ws", host="cdn.example.com"))
+    assert t == {"type": "ws", "path": "/ws", "headers": {"Host": "cdn.example.com"}}
+
+
+def test_transport_ws_minimal_prunes_empties():
+    assert _build_transport(_profile(type="ws")) == {"type": "ws"}
+
+
+def test_transport_grpc():
+    assert _build_transport(_profile(type="grpc", service_name="svc")) == {
+        "type": "grpc", "service_name": "svc"
+    }
+
+
+def test_transport_http_host_is_list():
+    t = _build_transport(_profile(type="http", host="h.example.com", path="/p"))
+    assert t == {"type": "http", "host": ["h.example.com"], "path": "/p"}
+
+
+def test_transport_httpupgrade_prunes_empty_headers():
+    t = _build_transport(_profile(type="httpupgrade", host="h", path="/p"))
+    assert t == {"type": "httpupgrade", "host": "h", "path": "/p"}
+
+
+def test_transport_quic():
+    assert _build_transport(_profile(type="quic")) == {"type": "quic"}
+
+
+def test_transport_tcp_is_empty():
+    assert _build_transport(_profile(type="tcp")) == {}
+
+
+# --- _prune_none_values -------------------------------------------------------
+
+def test_prune_removes_none_scalar():
+    assert _prune_none_values({"a": None, "b": 1}) == {"b": 1}
+
+
+def test_prune_keeps_false_zero_and_empty_string():
+    # Only None is stripped at scalar level; False/0/"" carry meaning and stay.
+    assert _prune_none_values({"a": False, "b": 0, "c": ""}) == {"a": False, "b": 0, "c": ""}
+
+
+def test_prune_removes_empty_collections():
+    assert _prune_none_values({"a": {}, "b": [], "c": 1}) == {"c": 1}
+
+
+def test_prune_filters_list_items_and_drops_nested_empty_dict():
+    assert _prune_none_values({"a": ["x", None, "", "y"], "b": {"c": None}}) == {"a": ["x", "y"]}
+
+
+def test_split_csv():
+    assert _split_csv("a, b ,,c ") == ["a", "b", "c"]
+    assert _split_csv("") == []
+
+
+# --- outbound integration -----------------------------------------------------
+
+def test_vless_tcp_outbound_has_no_transport_key():
+    proxy = _proxy(_profile(type="tcp"))
+    assert "transport" not in proxy
+
+
+def test_vless_ws_outbound_keeps_transport():
+    proxy = _proxy(_profile(type="ws", path="/ws"))
+    assert proxy["transport"]["type"] == "ws"
+
+
+def test_shadowsocks_outbound_has_no_tls():
+    proxy = _proxy(_profile(protocol="shadowsocks", method="aes-256-gcm", password="p"))
+    assert proxy["method"] == "aes-256-gcm"
+    assert proxy["password"] == "p"
+    assert "tls" not in proxy
+
+
+def test_vmess_non_tls_disables_tls():
+    proxy = _proxy(_profile(protocol="vmess", security="none"))
+    assert proxy["tls"] == {"enabled": False}
+
+
+def test_tuic_default_alpn_is_h3():
+    proxy = _proxy(_profile(protocol="tuic", password="p", alpn=""))
+    assert proxy["tls"]["alpn"] == ["h3"]
+
+
+def test_hysteria2_obfs_block_built():
+    proxy = _proxy(_profile(protocol="hysteria2", password="p", obfs="salamander", obfs_password="op"))
+    assert proxy["obfs"] == {"type": "salamander", "password": "op"}
+
+
+def test_hysteria2_no_obfs_when_absent():
+    proxy = _proxy(_profile(protocol="hysteria2", password="p"))
+    assert "obfs" not in proxy
+
+
+# --- top-level config invariants ----------------------------------------------
+
+def test_clash_api_secret_and_port_range():
+    api = build_sing_box_config(_profile())["experimental"]["clash_api"]
+    assert api["secret"] == "medved"
+    host, port = api["external_controller"].split(":")
+    assert host == "127.0.0.1"
+    assert 19090 <= int(port) <= 19990
+
+
+def test_tun_interface_name_prefix():
+    tun = build_sing_box_config(_profile())["inbounds"][0]
+    assert tun["type"] == "tun"
+    assert tun["interface_name"].startswith("singtun")
+
+
+def test_urltest_interval_and_tolerance_passthrough():
+    proxy = next(
+        o for o in build_sing_box_config(
+            [_profile("a"), _profile("b")], urltest_interval="2m"
+        )["outbounds"] if o["tag"] == "proxy"
+    )
+    assert proxy["interval"] == "2m"
+    assert proxy["tolerance"] == 50
+
+
+def test_invalid_process_rule_direction_dropped():
+    rules = build_sing_box_config(
+        _profile(), process_rules=[{"process_name": "x.exe", "outbound": "bogus"}]
+    )["route"]["rules"]
+    assert not any(r.get("process_name") == "x.exe" for r in rules)
+
+
+def test_routing_port_rule_coerced_to_int():
+    rules = build_sing_box_config(
+        _profile(), routing_rules=[{"kind": "port", "value": "8080", "action": "proxy"}]
+    )["route"]["rules"]
+    assert {"port": 8080, "outbound": "proxy"} in rules
+
+
+def test_routing_invalid_port_dropped():
+    rules = build_sing_box_config(
+        _profile(), routing_rules=[{"kind": "port", "value": "abc", "action": "proxy"}]
+    )["route"]["rules"]
+    assert not any("port" in r for r in rules)
+
+
+def test_routing_invalid_action_dropped():
+    rules = build_sing_box_config(
+        _profile(), routing_rules=[{"kind": "domain", "value": "x.com", "action": "nonsense"}]
+    )["route"]["rules"]
+    assert not any(r.get("domain") == "x.com" for r in rules)
+
+
+def test_unsupported_protocol_raises():
+    with pytest.raises(ValueError):
+        build_sing_box_config(_profile(protocol="wireguard"))
+
+
+# --- delay-test (dormant) outbounds for ping-while-connected ------------------
+
+def test_delay_test_profiles_add_dormant_outbounds():
+    cfg = build_sing_box_config(_profile("main"), delay_test_profiles=[_profile("a"), _profile("b")])
+    tags = {o["tag"] for o in cfg["outbounds"]}
+    assert "dt-0" in tags and "dt-1" in tags
+    # They must NOT be wired into routing — purely for /proxies/dt-N/delay probes.
+    assert cfg["route"]["final"] == "proxy"
+    rule_targets = {r.get("outbound") for r in cfg["route"]["rules"]}
+    assert "dt-0" not in rule_targets and "dt-1" not in rule_targets
+
+
+def test_delay_test_bad_profile_skipped_index_preserved():
+    bad = _profile("bad", protocol="wireguard")  # _build_outbound raises -> skipped
+    cfg = build_sing_box_config(_profile("main"), delay_test_profiles=[bad, _profile("ok")])
+    tags = {o["tag"] for o in cfg["outbounds"]}
+    assert "dt-0" not in tags   # bad one at index 0 skipped
+    assert "dt-1" in tags       # good one keeps its index-based tag
+
+
+def test_no_delay_test_profiles_means_no_dt_outbounds():
+    cfg = build_sing_box_config(_profile("main"))
+    assert not any(o["tag"].startswith("dt-") for o in cfg["outbounds"])
+
+
+def _proxy(profile):
+    """The single 'proxy' outbound produced for one profile."""
+    cfg = build_sing_box_config(profile)
+    return next(o for o in cfg["outbounds"] if o.get("tag") == "proxy")

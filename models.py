@@ -107,6 +107,7 @@ class AppSettings:
     language: str = "ru"
     last_seen_version: str = ""
     subscription_info: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    subscription_titles: Dict[str, str] = field(default_factory=dict)
     process_rules: List[Dict[str, str]] = field(default_factory=list)
     routing_rules: List[Dict[str, str]] = field(default_factory=list)
 
@@ -139,6 +140,9 @@ class AppSettings:
             subscription_info={
                 str(k): dict(v) for k, v in (data.get("subscription_info") or {}).items()
                 if isinstance(v, dict)
+            },
+            subscription_titles={
+                str(k): str(v) for k, v in (data.get("subscription_titles") or {}).items()
             },
             process_rules=[
                 {"process_name": str(r.get("process_name", "")), "outbound": str(r.get("outbound", "direct"))}

@@ -13,6 +13,7 @@ def build_sing_box_config(
     routing_rules: List[Dict[str, str]] | None = None,
     use_urltest: bool = True,
     urltest_interval: str = "5m",
+    delay_test_profiles=None,
 ) -> Dict[str, Any]:
     # Accept a single profile (legacy) or a list (URLTest/selector).
     if isinstance(profiles, VlessProfile):
@@ -126,6 +127,20 @@ def build_sing_box_config(
     if dns_rules:
         dns_block["rules"] = dns_rules
 
+    # Dormant per-server outbounds for latency probing via the Clash API
+    # (/proxies/dt-N/delay) while connected — the same metric Karing shows. They
+    # are not referenced by any route rule, so sing-box never dials them for real
+    # traffic; only an explicit delay request connects them. A profile that fails
+    # to build is skipped (index preserved) so one bad server can't break the run.
+    delay_outbounds: List[Dict[str, Any]] = []
+    for index, profile in enumerate(delay_test_profiles or []):
+        try:
+            out = _build_outbound(profile)
+        except Exception:
+            continue
+        out["tag"] = f"dt-{index}"
+        delay_outbounds.append(_prune_none_values(out))
+
     return {
         "log": {
             "level": "warn",
@@ -142,7 +157,7 @@ def build_sing_box_config(
                 "stack": "system",
             }
         ],
-        "outbounds": proxy_outbounds + [
+        "outbounds": proxy_outbounds + delay_outbounds + [
             {
                 "type": "direct",
                 "tag": "direct",

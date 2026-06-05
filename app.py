@@ -16,11 +16,12 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import deque
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, Menu, StringVar, filedialog, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Canvas, Listbox, Menu, StringVar, filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import customtkinter as ctk
@@ -29,13 +30,14 @@ from typing import Any, Dict, List, Optional
 import pystray
 from PIL import Image, ImageDraw
 
+import flags
 from config import build_sing_box_config
 from models import VlessProfile
 from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.9.9"
+__version__ = "0.10.0"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -256,6 +258,93 @@ def _get_hwid() -> str:
         return str(value).strip()
     except Exception:
         return ""
+
+
+def _list_running_processes() -> List[str]:
+    """Return sorted, de-duplicated base names of currently running processes
+    (e.g. 'chrome.exe'), for the process-rule picker so the user can select an
+    exe instead of guessing its name.
+
+    Uses `tasklist` (no extra dependency, same subprocess style as the rest of
+    the app) and never opens a console window. Windows-only; returns [] on any
+    other OS or on failure, in which case the picker degrades to a plain text
+    field — manual entry always keeps working."""
+    if os.name != "nt":
+        return []
+    try:
+        result = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, timeout=5,
+            encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            return []
+        names = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # CSV row: "image.exe","PID","Session",...  -> first quoted field.
+            first = line.split('","', 1)[0].strip().strip('"')
+            if first.lower().endswith(".exe"):
+                names.add(first)
+        return sorted(names, key=str.lower)
+    except Exception:
+        return []
+
+
+def _try_b64_text(value: str) -> str:
+    """Decode base64 to UTF-8 text, or '' if it isn't clean printable text.
+    Strict UTF-8 (no errors='ignore') so binary payloads are rejected, not
+    turned into mojibake."""
+    try:
+        pad = (4 - len(value) % 4) % 4
+        decoded = base64.b64decode(value + "=" * pad, validate=False).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return ""
+    if not decoded or any(ord(ch) < 9 for ch in decoded):
+        return ""
+    return decoded
+
+
+def _filename_from_content_disposition(value: str) -> str:
+    """Pull a name out of a Content-Disposition header (RFC 5987 filename* or
+    plain filename=), dropping a trailing config extension."""
+    if not value:
+        return ""
+    match = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", value, re.IGNORECASE)
+    if match:
+        try:
+            name = urllib.parse.unquote(match.group(1).strip())
+        except Exception:
+            name = match.group(1).strip()
+    else:
+        match = re.search(r'filename\s*=\s*"?([^";]+)"?', value, re.IGNORECASE)
+        name = match.group(1).strip() if match else ""
+    if not name:
+        return ""
+    return re.sub(r"\.(txt|yaml|yml|json|conf|cfg)$", "", name, flags=re.IGNORECASE)
+
+
+def _decode_subscription_title(headers) -> str:
+    """Best-effort subscription name from response headers, so the UI can show
+    it instead of the raw URL. Tries the common conventions:
+      * 'Profile-Title' — 'base64:<...>', bare base64, or plain text
+      * 'Content-Disposition: ...; filename="<name>"'
+    Returns '' when nothing usable is present."""
+    raw = (headers.get("profile-title") or headers.get("Profile-Title") or "").strip()
+    if raw:
+        if raw.lower().startswith("base64:"):
+            return _try_b64_text(raw[len("base64:"):].strip())
+        # No explicit prefix: a spaceless token might still be bare base64.
+        if " " not in raw:
+            decoded = _try_b64_text(raw)
+            if decoded:
+                return decoded.strip()
+        return raw
+    disposition = headers.get("content-disposition") or headers.get("Content-Disposition") or ""
+    return _filename_from_content_disposition(disposition)
 
 
 def _tcp_ping(host: str, port: int, timeout: float = 3.0) -> Optional[float]:
@@ -666,6 +755,9 @@ class VlessApp(ctk.CTk):
         self.process: Optional[subprocess.Popen[str]] = None
         self._process_lock = threading.Lock()
         self._api_port: Optional[int] = None
+        # ping_key -> "dt-N" outbound tag in the running config, so servers can
+        # be latency-probed through sing-box (Clash API) while the VPN is up.
+        self._delay_tags: Dict[str, str] = {}
         self._monitor_generation = 0
         self._monitor_thread: Optional[threading.Thread] = None
         self._tray_icon: Optional[Any] = None
@@ -1153,11 +1245,15 @@ class VlessApp(ctk.CTk):
 
         for source_url, indices in sorted(groups.items(), key=lambda kv: (kv[0] == "", kv[0])):
             if source_url:
-                label = source_url
-                if source_url.startswith("karing://"):
+                title = self.settings.subscription_titles.get(source_url, "")
+                if title:
+                    label = title
+                elif source_url.startswith("karing://"):
                     label = f"Karing: {source_url[len('karing://'):]}"
                 elif source_url.startswith("http"):
                     label = f"Подписка: {source_url}"
+                else:
+                    label = source_url
                 group_iid = f"g:{source_url}"
             else:
                 label = "Импортированные вручную"
@@ -1165,14 +1261,38 @@ class VlessApp(ctk.CTk):
             self.profile_list.insert("", END, iid=group_iid, text=f"{label}  ({len(indices)})", open=True)
             for index in indices:
                 profile = self.profiles[index]
+                if self._is_fake_profile(profile):
+                    # Info/stub row: shown for its text, but inert. No ✓/✗
+                    # toggle, no ping — a muted "инфо" marker instead.
+                    self.profile_list.insert(
+                        group_iid, END, iid=str(index),
+                        text=f"ℹ️ {flags.strip_flag_emoji(profile.name) or profile.name}",
+                        values=(profile.server, "—", "—", "инфо"),
+                        tags=("info",),
+                    )
+                    continue
                 transport = f"{profile.protocol}/{profile.type or 'tcp'}"
                 ping = self._format_profile_ping(self._profile_ping_key(profile))
                 auto_marker = "✓" if profile.enabled else "✗"
-                self.profile_list.insert(
-                    group_iid, END, iid=str(index),
-                    text=profile.name,
-                    values=(profile.server, transport, ping, auto_marker),
-                )
+                # Real flag image in place of the flag emoji Windows can't draw
+                # (🇩🇪 → "DE"). Falls back to clean text where we don't have one.
+                code = flags.iso_from_flag_emoji(profile.name)
+                photo = flags.flag_photoimage(code) if code else None
+                display = flags.strip_flag_emoji(profile.name)
+                if not display and photo is None:
+                    display = profile.name
+                if photo is not None:
+                    self.profile_list.insert(
+                        group_iid, END, iid=str(index),
+                        text=f" {display}", image=photo,
+                        values=(profile.server, transport, ping, auto_marker),
+                    )
+                else:
+                    self.profile_list.insert(
+                        group_iid, END, iid=str(index),
+                        text=display,
+                        values=(profile.server, transport, ping, auto_marker),
+                    )
 
         # Truthy check, not `is not None`: selected_uuid is "" for non-VLESS
         # profiles, and an empty-string match would re-select the first
@@ -1335,6 +1455,7 @@ class VlessApp(ctk.CTk):
                     save_settings(self.settings)
 
                 self.after(0, self._append_profiles, profiles)
+                self.after(0, self._rebuild_subscription_panel)
                 self.after(0, self.log, f"Импортировано профилей из подписки: {len(profiles)}")
             except Exception as error:
                 self.after(0, lambda e=error: self._show_toast("MeDVeD", str(e), "error"))
@@ -1374,6 +1495,7 @@ class VlessApp(ctk.CTk):
                             excluded += 1
                     save_profiles(self.profiles, self.settings)
                     self.refresh_profiles()
+                    self._rebuild_subscription_panel()
                     self.log(f"Подписки обновлены, добавлено новых профилей: {added}")
                     if excluded:
                         self.log(
@@ -1390,6 +1512,117 @@ class VlessApp(ctk.CTk):
                 self.after(0, lambda e=error: self._show_toast("MeDVeD", str(e), "error"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _format_sub_info_line(self, url: str) -> str:
+        """Short per-subscription traffic/expiry line for the panel, or ''."""
+        info = self.settings.subscription_info.get(url) or {}
+        parts: List[str] = []
+        total = int(info.get("total", 0))
+        if total > 0:
+            used = int(info.get("upload", 0)) + int(info.get("download", 0))
+            parts.append(f"осталось {_format_bytes(max(0, total - used))} / {_format_bytes(total)}")
+        expire = int(info.get("expire", 0))
+        if expire > 0:
+            parts.append("до " + time.strftime("%d.%m.%Y", time.localtime(expire)))
+        return " · ".join(parts)
+
+    def _rebuild_subscription_panel(self) -> None:
+        """Redraw the per-subscription list (name + ⟳ refresh + ✕ remove) in the
+        Profiles view. Safe to call before the view exists (no-op)."""
+        holder = getattr(self, "sub_rows_holder", None)
+        if holder is None:
+            return
+        try:
+            for widget in holder.winfo_children():
+                widget.destroy()
+        except Exception:
+            return
+        subscriptions = self.settings.subscriptions
+        if not subscriptions:
+            ctk.CTkLabel(
+                holder, text="Пока нет подписок", font=ctk.CTkFont(size=11), text_color="#777777",
+            ).pack(anchor="w", padx=10, pady=4)
+            return
+        for url in subscriptions:
+            row = ctk.CTkFrame(holder, fg_color="#2b2b2b", corner_radius=6)
+            row.pack(fill=X, padx=4, pady=3)
+
+            ctk.CTkButton(
+                row, text="✕", width=30, height=28, fg_color="#7a3a3a", hover_color="#8a4a4a",
+                command=lambda u=url: self.remove_subscription(u),
+            ).pack(side=RIGHT, padx=(0, 6), pady=6)
+            ctk.CTkButton(
+                row, text="⟳", width=30, height=28,
+                command=lambda u=url: self.refresh_one_subscription(u),
+            ).pack(side=RIGHT, padx=(0, 4), pady=6)
+
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side=LEFT, fill=X, expand=True, padx=(10, 4), pady=4)
+            title = self.settings.subscription_titles.get(url) or url
+            ctk.CTkLabel(
+                text_col, text=title, font=ctk.CTkFont(size=12),
+                anchor="w", justify="left", wraplength=230,
+            ).pack(anchor="w", fill=X)
+            info_line = self._format_sub_info_line(url)
+            if info_line:
+                ctk.CTkLabel(
+                    text_col, text=info_line, font=ctk.CTkFont(size=10), text_color="#888888",
+                    anchor="w", justify="left",
+                ).pack(anchor="w")
+
+    def refresh_one_subscription(self, url: str) -> None:
+        """Re-fetch a single subscription and replace just its servers."""
+        def worker() -> None:
+            try:
+                new_profiles = self._fetch_subscription_profiles(url)
+
+                def update() -> None:
+                    self.profiles = [p for p in self.profiles if p.source_url != url]
+                    existing_keys = {
+                        (p.uuid or p.password, p.server, p.port) for p in self.profiles
+                    }
+                    added = 0
+                    for profile in new_profiles:
+                        key = (profile.uuid or profile.password, profile.server, profile.port)
+                        if key in existing_keys:
+                            continue
+                        self.profiles.append(profile)
+                        existing_keys.add(key)
+                        added += 1
+                    save_profiles(self.profiles, self.settings)
+                    self.refresh_profiles()
+                    self._rebuild_subscription_panel()
+                    title = self.settings.subscription_titles.get(url) or url
+                    self.log(f"Подписка обновлена ({title}): {added} новых")
+                    self._show_snackbar(f"Подписка обновлена: +{added}", "ok")
+
+                self.after(0, update)
+            except Exception as error:
+                self.after(0, lambda e=error: self._show_toast("MeDVeD", str(e), "error"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def remove_subscription(self, url: str) -> None:
+        """Remove a subscription and all of its servers (with confirmation)."""
+        title = self.settings.subscription_titles.get(url) or url
+        if not self._show_confirm(
+            "Удалить подписку",
+            f"Удалить подписку «{title}» и все её серверы?",
+            danger=True,
+        ):
+            return
+        self.settings.subscriptions = [u for u in self.settings.subscriptions if u != url]
+        self.settings.subscription_info.pop(url, None)
+        self.settings.subscription_titles.pop(url, None)
+        save_settings(self.settings)
+        before = len(self.profiles)
+        self.profiles = [p for p in self.profiles if p.source_url != url]
+        removed = before - len(self.profiles)
+        save_profiles(self.profiles, self.settings)
+        self.refresh_profiles()
+        self._rebuild_subscription_panel()
+        self._refresh_subscription_info_label()
+        self.log(f"Удалена подписка ({removed} серверов): {title}")
 
     _SUBSCRIPTION_USER_AGENTS = (
         "v2rayN/7.0",
@@ -1420,6 +1653,11 @@ class VlessApp(ctk.CTk):
                         self._save_subscription_info(url, sub_info_header)
                     else:
                         self.after(0, self.log, "Подписка не сообщила лимиты (нет заголовка subscription-userinfo)")
+                    title = _decode_subscription_title(response.headers)
+                    if title:
+                        self._save_subscription_title(url, title)
+                    else:
+                        self.after(0, self.log, "Подписка не прислала имя (нет заголовка Profile-Title / Content-Disposition)")
             except Exception as error:
                 last_error = f"{type(error).__name__}: {error}"
                 continue
@@ -1435,17 +1673,28 @@ class VlessApp(ctk.CTk):
 
             links = [line.strip() for line in decoded.splitlines() if line.strip()]
             profiles: List[VlessProfile] = []
+            real_count = 0
             for index, link in enumerate(links, start=1):
                 try:
                     profile = parse_link(link, f"Subscription {index}", source_url=url)
                 except ValueError:
                     continue
                 if self._is_fake_profile(profile):
+                    # Keep info/stub rows (127.0.0.1:1, "Приложение не
+                    # поддерживается") so their text stays visible, but force
+                    # them out of the auto pool. Everything downstream treats an
+                    # _is_fake_profile row as inert (no auto, not connectable).
                     got_fake = True
+                    profile.enabled = False
+                    profiles.append(profile)
                     continue
                 profile.enabled = self._default_auto_enabled(profile.name)
                 profiles.append(profile)
-            if profiles:
+                real_count += 1
+            # Only accept the response when it has at least one real server. A
+            # payload that is *only* stubs means the provider blocks third-party
+            # clients — fall through to the got_fake error below instead.
+            if real_count > 0:
                 return profiles
 
         if got_fake:
@@ -1481,6 +1730,21 @@ class VlessApp(ctk.CTk):
         except Exception:
             pass
         self.after(0, self._refresh_subscription_info_label)
+        self.after(0, self._rebuild_subscription_panel)
+
+    def _save_subscription_title(self, url: str, title: str) -> None:
+        """Persist the subscription's own name (from its headers) per-url so the
+        list can show it instead of the raw URL. No-op if unchanged."""
+        if not title or self.settings.subscription_titles.get(url) == title:
+            return
+        self.settings.subscription_titles[url] = title
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self.after(0, self.log, f"Подписка прислала имя: {title}")
+        self.after(0, self.refresh_profiles)
+        self.after(0, self._rebuild_subscription_panel)
 
     def _refresh_subscription_info_label(self) -> None:
         label = getattr(self, "sub_info_label", None)
@@ -1590,9 +1854,12 @@ class VlessApp(ctk.CTk):
             if not isinstance(entry, dict):
                 continue
             profile = self._clash_entry_to_profile(entry, source_url)
-            if profile is not None and not self._is_fake_profile(profile):
-                profile.enabled = self._default_auto_enabled(profile.name)
-                result.append(profile)
+            if profile is None:
+                continue
+            # Same inert-stub handling as the link-list path: keep 127.0.0.1:1 /
+            # localhost / "не поддерживается" rows visible but out of the auto pool.
+            profile.enabled = False if self._is_fake_profile(profile) else self._default_auto_enabled(profile.name)
+            result.append(profile)
         return result
 
     @staticmethod
@@ -1724,6 +1991,8 @@ class VlessApp(ctk.CTk):
             return
         changed = 0
         for index, p in enumerate(self.profiles):
+            if self._is_fake_profile(p):
+                continue  # info rows never enter auto
             new_state = self._default_auto_enabled(p.name)
             if p.enabled != new_state:
                 p.enabled = new_state
@@ -1754,6 +2023,7 @@ class VlessApp(ctk.CTk):
                 targets = [p for p in self.profiles if not p.source_url]
             else:
                 targets = [p for p in self.profiles if p.source_url == group_url]
+        targets = [p for p in targets if not self._is_fake_profile(p)]
         if not targets:
             self._show_toast(
                 "MeDVeD",
@@ -1802,6 +2072,8 @@ class VlessApp(ctk.CTk):
             return
         if not (0 <= index < len(self.profiles)):
             return
+        if self._is_fake_profile(self.profiles[index]):
+            return  # info/stub rows aren't part of auto mode — nothing to toggle
         self.profiles[index].enabled = not self.profiles[index].enabled
         save_profiles(self.profiles, self.settings)
         try:
@@ -1862,6 +2134,19 @@ class VlessApp(ctk.CTk):
                     self._show_toast("MeDVeD", "Не удалось перезапустить с правами администратора.", "error")
             return
 
+        # Info/stub rows are not connectable — drop them from the selection.
+        if self.selected_indices:
+            self.selected_indices = [
+                i for i in self.selected_indices if not self._is_fake_profile(self.profiles[i])
+            ]
+            if not self.selected_indices:
+                self._show_toast(
+                    "MeDVeD",
+                    "Это информационная строка подписки — к ней нельзя подключиться.",
+                    "info",
+                )
+                return
+
         active_name = "—"
         if self.selected_indices:
             if len(self.selected_indices) == 1:
@@ -1879,6 +2164,7 @@ class VlessApp(ctk.CTk):
                 group_profiles = [p for p in self.profiles if not p.source_url]
             else:
                 group_profiles = [p for p in self.profiles if p.source_url == group_url]
+            group_profiles = [p for p in group_profiles if not self._is_fake_profile(p)]
             if not group_profiles:
                 self._show_toast("MeDVeD", "В группе нет профилей.", "info")
                 return
@@ -1908,6 +2194,10 @@ class VlessApp(ctk.CTk):
                 return value if isinstance(value, (int, float)) else float("inf")
             connect_target = sorted(connect_target, key=ping_sort_key)
 
+        # Every real server is added to the config as a dormant outbound so its
+        # latency can be probed through sing-box (Clash API) while connected —
+        # без отключения VPN. The tag map lets test_all_pings address each one.
+        dt_profiles = [p for p in self.profiles if not self._is_fake_profile(p)]
         try:
             config_data = build_sing_box_config(
                 connect_target,
@@ -1915,10 +2205,12 @@ class VlessApp(ctk.CTk):
                 process_rules=self.settings.process_rules,
                 routing_rules=self.settings.routing_rules,
                 use_urltest=self.settings.urltest_auto_switch,
+                delay_test_profiles=dt_profiles,
             )
         except Exception as error:
             self._show_toast("Ошибка конфига", str(error), "error")
             return
+        self._delay_tags = {self._profile_ping_key(p): f"dt-{i}" for i, p in enumerate(dt_profiles)}
 
         try:
             controller = config_data["experimental"]["clash_api"]["external_controller"]
@@ -2449,7 +2741,7 @@ class VlessApp(ctk.CTk):
         button = getattr(self, "server_button", None)
         if button is None:
             return
-        valid_keys = [self._AUTO_KEY] + [p.name for p in self.profiles]
+        valid_keys = [self._AUTO_KEY] + [p.name for p in self.profiles if not self._is_fake_profile(p)]
         if self.server_choice_var.get() not in valid_keys:
             self.server_choice_var.set(self._AUTO_KEY)
         button.configure(text=f"{self._format_choice(self.server_choice_var.get())}  ▼")
@@ -2462,7 +2754,7 @@ class VlessApp(ctk.CTk):
 
     def _open_server_menu(self) -> None:
         self._hide_burger()
-        items = [(self._AUTO_KEY, self._auto_label())] + [(p.name, p.name) for p in self.profiles]
+        items = [(self._AUTO_KEY, self._auto_label())] + [(p.name, p.name) for p in self.profiles if not self._is_fake_profile(p)]
 
         button = self.server_button
         bx = button.winfo_rootx() - self.winfo_rootx()
@@ -2534,16 +2826,17 @@ class VlessApp(ctk.CTk):
             return
         choice = self.server_choice_var.get()
         if choice == self._AUTO_KEY:
-            if len(self.profiles) == 1:
-                self.selected_indices = [0]
-            else:
-                # In auto mode, skip profiles the user explicitly excluded.
-                # Falls back to "all" if every profile happens to be disabled,
-                # so auto-connect can't deadlock.
-                enabled_indices = [i for i, p in enumerate(self.profiles) if p.enabled]
-                if not enabled_indices:
-                    enabled_indices = list(range(len(self.profiles)))
-                self.selected_indices = enabled_indices
+            # Skip info/stub rows entirely, then skip profiles the user excluded.
+            # Falls back to "all connectable" if every profile happens to be
+            # disabled, so auto-connect can't deadlock.
+            connectable = [i for i, p in enumerate(self.profiles) if not self._is_fake_profile(p)]
+            if not connectable:
+                self._show_toast(
+                    "MeDVeD", "Нет серверов для подключения (только информационные строки).", "info"
+                )
+                return
+            enabled_indices = [i for i in connectable if self.profiles[i].enabled]
+            self.selected_indices = enabled_indices or connectable
         else:
             match_idx = next((i for i, p in enumerate(self.profiles) if p.name == choice), None)
             if match_idx is None:
@@ -2604,6 +2897,9 @@ class VlessApp(ctk.CTk):
         # because that requires the user to know about it — a single click
         # right on the ✓/✗ is the intuitive gesture.
         self.profile_list.bind("<ButtonRelease-1>", self._on_profile_click)
+        # Muted styling for info/stub rows (127.0.0.1:1, "не поддерживается"):
+        # visible for their text, but inert — no auto, not connectable.
+        self.profile_list.tag_configure("info", foreground="#888888")
         self.refresh_profiles()
 
         actions = ctk.CTkFrame(left, fg_color="transparent")
@@ -2645,8 +2941,15 @@ class VlessApp(ctk.CTk):
         )
         self.subscription_entry.pack(fill=X, padx=12, pady=(2, 4))
         _bind_clipboard_shortcuts(self.subscription_entry)
-        ctk.CTkButton(sub_box, text="Импортировать подписку", command=self.import_subscription, height=34).pack(fill=X, padx=12, pady=(6, 4))
-        ctk.CTkButton(sub_box, text="Обновить все подписки", command=self.refresh_subscriptions, height=34).pack(fill=X, padx=12, pady=(0, 10))
+        ctk.CTkButton(sub_box, text="Импортировать подписку", command=self.import_subscription, height=34).pack(fill=X, padx=12, pady=(6, 8))
+
+        ctk.CTkLabel(
+            sub_box, text="Мои подписки", font=ctk.CTkFont(size=12), text_color="#aaaaaa",
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+        self.sub_rows_holder = ctk.CTkFrame(sub_box, fg_color="transparent")
+        self.sub_rows_holder.pack(fill=X, padx=4, pady=(0, 4))
+        self._rebuild_subscription_panel()
+        ctk.CTkButton(sub_box, text="Обновить все подписки", command=self.refresh_subscriptions, height=32).pack(fill=X, padx=12, pady=(2, 10))
 
         self._views["profiles"] = view
 
@@ -3047,6 +3350,10 @@ class VlessApp(ctk.CTk):
     def _prompt_process_rule(self, on_done) -> None:
         name_var = StringVar()
         direction_var = StringVar(value="proxy")
+        processes = _list_running_processes()
+        # Guard so that filling the entry from a list click doesn't re-trigger
+        # the keystroke filter (which would collapse the list to that one item).
+        suppress_filter = {"on": False}
 
         def build_body(card: "ctk.CTkFrame") -> None:
             ctk.CTkLabel(card, text="Имя процесса (например chrome.exe)", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(0, 4))
@@ -3054,6 +3361,58 @@ class VlessApp(ctk.CTk):
             entry.pack(fill=X, padx=20)
             _bind_clipboard_shortcuts(entry)
             entry.focus_set()
+
+            if processes:
+                ctk.CTkLabel(
+                    card, text="…или выберите из запущенных процессов (двойной клик — добавить):",
+                    font=ctk.CTkFont(size=10), text_color="#aaaaaa",
+                ).pack(anchor="w", padx=20, pady=(10, 2))
+
+                list_holder = ctk.CTkFrame(card, fg_color="transparent")
+                list_holder.pack(fill=X, padx=20)
+
+                is_dark = ctk.get_appearance_mode() == "Dark"
+                listbox = Listbox(
+                    list_holder, height=8, activestyle="none",
+                    bg=("#2b2b2b" if is_dark else "#f5f5f5"),
+                    fg=("#dddddd" if is_dark else "#1a1a1a"),
+                    selectbackground="#1f6aa5", selectforeground="#ffffff",
+                    highlightthickness=0, borderwidth=0, exportselection=False,
+                )
+                scrollbar = ctk.CTkScrollbar(list_holder, command=listbox.yview)
+                listbox.configure(yscrollcommand=scrollbar.set)
+                scrollbar.pack(side=RIGHT, fill=Y)
+                listbox.pack(side=LEFT, fill=BOTH, expand=True)
+
+                def populate(items) -> None:
+                    listbox.delete(0, END)
+                    for item in items:
+                        listbox.insert(END, item)
+
+                def apply_filter(*_) -> None:
+                    if suppress_filter["on"]:
+                        return
+                    query = name_var.get().strip().lower()
+                    populate([p for p in processes if query in p.lower()] if query else processes)
+
+                def select_from_list(_event=None) -> None:
+                    selection = listbox.curselection()
+                    if not selection:
+                        return
+                    suppress_filter["on"] = True
+                    name_var.set(listbox.get(selection[0]))
+                    suppress_filter["on"] = False
+
+                def confirm_from_list(_event=None) -> None:
+                    select_from_list()
+                    if name_var.get().strip():
+                        on_ok()
+                        self._dismiss_overlay()
+
+                populate(processes)
+                name_var.trace_add("write", apply_filter)
+                listbox.bind("<<ListboxSelect>>", select_from_list)
+                listbox.bind("<Double-Button-1>", confirm_from_list)
 
             ctk.CTkLabel(card, text="Направление", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=20, pady=(12, 4))
             row = ctk.CTkFrame(card, fg_color="transparent")
@@ -3251,7 +3610,7 @@ class VlessApp(ctk.CTk):
         servers = pystray.Menu(*[
             pystray.MenuItem(profile.name, self._tray_server_action(profile))
             for profile in self.profiles[: self._TRAY_SERVERS_LIMIT]
-            if profile.name
+            if profile.name and not self._is_fake_profile(profile)
         ]) if self.profiles else None
 
         items = [
@@ -3399,8 +3758,53 @@ class VlessApp(ctk.CTk):
         if not self.profiles:
             self._show_toast("MeDVeD", "Нет профилей для проверки.", "info")
             return
-        self.log(f"Проверка пинга {len(self.profiles)} профилей (1-RTT TCP, параллельно)...")
-        snapshot = list(self.profiles)
+        non_fake = [p for p in self.profiles if not self._is_fake_profile(p)]
+        if not non_fake:
+            self._show_toast("MeDVeD", "Нет серверов для проверки (только информационные строки).", "info")
+            return
+
+        if self.active_var.get():
+            # VPN is up: a raw TCP connect is terminated locally by the TUN
+            # (~1 ms, meaningless). Measure real per-server latency the way Karing
+            # does — through sing-box itself, via the Clash API delay on each
+            # server's dormant outbound. No need to disconnect.
+            tags = self._delay_tags
+            testable = [p for p in non_fake if self._profile_ping_key(p) in tags]
+            if self._api_port is None or not testable:
+                self._show_toast(
+                    "Проверка пинга",
+                    "Замер пинга через туннель станет доступен после переподключения — "
+                    "серверы должны попасть в активный конфиг. Нажмите «Подключить» "
+                    "заново и повторите проверку.",
+                    "info",
+                )
+                return
+            self.log(f"Проверка пинга {len(testable)} серверов через sing-box (Clash API)...")
+
+            def probe_api(profile: VlessProfile) -> None:
+                tag = tags[self._profile_ping_key(profile)]
+                result = self._api_request(
+                    f"/proxies/{tag}/delay?timeout=2000&url=http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
+                )
+                ping_ms: Optional[float] = None
+                if isinstance(result, dict) and "delay" in result:
+                    try:
+                        ping_ms = float(result["delay"])
+                    except (TypeError, ValueError):
+                        ping_ms = None
+                self.after(0, self._set_profile_ping, self._profile_ping_key(profile), ping_ms)
+
+            def worker_api() -> None:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=min(8, len(testable))) as pool:
+                    list(pool.map(probe_api, testable))
+                self.after(0, self.log, "Проверка пинга завершена")
+
+            threading.Thread(target=worker_api, daemon=True).start()
+            return
+
+        # VPN is off: direct 1-RTT TCP to each server is the real RTT (~Karing).
+        self.log(f"Проверка пинга {len(non_fake)} профилей (1-RTT TCP, параллельно)...")
 
         def probe(profile: VlessProfile) -> None:
             ping_ms = _ping_avg(profile.server, profile.port, attempts=3)
@@ -3409,8 +3813,8 @@ class VlessApp(ctk.CTk):
 
         def worker() -> None:
             from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=min(8, len(snapshot))) as pool:
-                list(pool.map(probe, snapshot))
+            with ThreadPoolExecutor(max_workers=min(8, len(non_fake))) as pool:
+                list(pool.map(probe, non_fake))
             self.after(0, self.log, "Проверка пинга завершена")
 
         threading.Thread(target=worker, daemon=True).start()

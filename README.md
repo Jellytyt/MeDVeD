@@ -60,10 +60,6 @@
 Багрепорты и предложения — в [Issues](https://github.com/Jellytyt/MeDVeD/issues).
 Подробный лог проблемы лежит в `%LOCALAPPDATA%\vless_manager\app.log` — приложите его при обращении.
 
-## Собрать самому / разработка
-
-Инструкции по сборке из исходников и выпуску релизов — в [DEVELOPMENT.md](DEVELOPMENT.md).
-
 ## Лицензия
 
 [MIT](LICENSE)

@@ -98,3 +98,214 @@ def test_unknown_scheme_raises():
 def test_vless_missing_uuid_raises():
     with pytest.raises(ValueError):
         parse_link("vless://@example.com:443#x")
+
+
+# --- defaults, aliases and field mapping -------------------------------------
+
+def test_vless_defaults_when_query_empty():
+    p = parse_link("vless://uuid-1@example.com:443")
+    assert p.port == 443
+    assert p.security == "tls"      # default
+    assert p.type == "tcp"          # default
+    assert p.fp == "chrome"         # default
+    assert p.name == "Imported"     # no #fragment -> default_name
+
+
+def test_vless_default_port_is_443():
+    p = parse_link("vless://uuid-1@example.com")
+    assert p.port == 443
+
+
+def test_vless_sni_falls_back_to_peer():
+    p = parse_link("vless://uuid-1@example.com:443?peer=sni.example.com")
+    assert p.sni == "sni.example.com"
+
+
+def test_vless_reality_fields_roundtrip():
+    link = (
+        "vless://uuid-1@example.com:443?security=reality&type=grpc&serviceName=grpcsvc"
+        "&pbk=PUBKEY123&sid=ab12&flow=xtls-rprx-vision&fp=firefox#Reality"
+    )
+    p1, p2 = _roundtrip(link)
+    assert p1.security == "reality"
+    assert p1.public_key == "PUBKEY123"
+    assert p1.short_id == "ab12"
+    assert p1.flow == "xtls-rprx-vision"
+    _assert_same(p1, p2, ["security", "public_key", "short_id", "flow", "service_name", "fp"])
+
+
+def test_vless_ipv6_host():
+    p = parse_link("vless://uuid-1@[2001:db8::1]:443#v6")
+    assert p.server == "2001:db8::1"
+    assert p.port == 443
+
+
+def test_fragment_url_decoding():
+    p = parse_link("vless://uuid-1@example.com:443#%D0%9C%D0%BE%D0%B9%20%D1%83%D0%B7%D0%B5%D0%BB")
+    assert p.name == "Мой узел"
+
+
+def test_hy2_alias_normalizes_and_roundtrips():
+    p1 = parse_link("hy2://pw@h2.example.com:443?sni=h2.example.com#X")
+    p2 = parse_link(profile_to_link(p1))
+    assert p1.protocol == "hysteria2"
+    _assert_same(p1, p2, ["protocol", "password", "server", "port", "sni"])
+
+
+def test_trojan_allow_insecure_flag():
+    p = parse_link("trojan://pw@t.example.com:443?allowInsecure=1#T")
+    assert p.insecure is True
+
+
+def test_tuic_insecure_alias():
+    p = parse_link("tuic://uuid-1:pw@tu.example.com:443?allow_insecure=1#T")
+    assert p.insecure is True
+
+
+def test_ss_legacy_format():
+    # Legacy: ss://BASE64(method:password@host:port)#name
+    raw = base64.b64encode(b"aes-256-gcm:pw@s.example.com:8388").decode()
+    p = parse_link(f"ss://{raw}#Legacy")
+    assert p.protocol == "shadowsocks"
+    assert p.method == "aes-256-gcm"
+    assert p.password == "pw"
+    assert p.server == "s.example.com"
+    assert p.port == 8388
+
+
+def test_ss_sip002_with_query_after_host():
+    userinfo = base64.b64encode(b"chacha20-ietf-poly1305:pw").decode()
+    p = parse_link(f"ss://{userinfo}@s.example.com:8388?plugin=obfs#Q")
+    assert p.server == "s.example.com"
+    assert p.port == 8388
+    assert p.method == "chacha20-ietf-poly1305"
+
+
+def test_vmess_base64_without_padding():
+    data = {"v": "2", "ps": "n", "add": "v.example.com", "port": "443", "id": "uuid-1", "net": "tcp"}
+    encoded = base64.b64encode(json.dumps(data).encode()).decode().rstrip("=")
+    p = parse_link("vmess://" + encoded)
+    assert p.protocol == "vmess"
+    assert p.server == "v.example.com"
+
+
+# --- malformed input rejection ------------------------------------------------
+
+def test_vmess_invalid_base64_raises():
+    with pytest.raises(ValueError):
+        parse_link("vmess://!!!not-base64!!!")
+
+
+def test_vmess_missing_server_raises():
+    data = {"v": "2", "id": "uuid-1", "port": "443"}  # no 'add'
+    link = "vmess://" + base64.b64encode(json.dumps(data).encode()).decode()
+    with pytest.raises(ValueError):
+        parse_link(link)
+
+
+def test_trojan_missing_password_raises():
+    with pytest.raises(ValueError):
+        parse_link("trojan://@t.example.com:443#x")
+
+
+def test_tuic_missing_uuid_raises():
+    with pytest.raises(ValueError):
+        parse_link("tuic://@tu.example.com:443#x")
+
+
+def test_hysteria2_missing_password_raises():
+    with pytest.raises(ValueError):
+        parse_link("hysteria2://@h2.example.com:443#x")
+
+
+def test_ss_missing_port_raises():
+    userinfo = base64.b64encode(b"aes-256-gcm:pw").decode()
+    with pytest.raises(ValueError):
+        parse_link(f"ss://{userinfo}@s.example.com#NoPort")
+
+
+def test_empty_string_raises():
+    with pytest.raises(ValueError):
+        parse_link("")
+
+
+def test_export_unsupported_protocol_raises():
+    p = parse_link("vless://uuid-1@example.com:443#x")
+    p.protocol = "wireguard"
+    with pytest.raises(ValueError):
+        profile_to_link(p)
+
+
+# --- defensive guards: each parser rejects a mismatched scheme ----------------
+
+@pytest.mark.parametrize("func_name, wrong_link", [
+    ("parse_vless_link", "trojan://x@h:443"),
+    ("parse_vmess_link", "vless://x@h:443"),
+    ("parse_trojan_link", "vless://x@h:443"),
+    ("parse_ss_link", "vless://x@h:443"),
+    ("parse_hysteria2_link", "vless://x@h:443"),
+    ("parse_tuic_link", "vless://x@h:443"),
+])
+def test_parser_rejects_wrong_scheme(func_name, wrong_link):
+    import parser as parser_mod
+    with pytest.raises(ValueError):
+        getattr(parser_mod, func_name)(wrong_link)
+
+
+# --- missing-host / malformed structural rejections ---------------------------
+
+def test_vless_missing_server_raises():
+    with pytest.raises(ValueError):
+        parse_link("vless://uuid-1@:443#x")
+
+
+def test_trojan_missing_server_raises():
+    with pytest.raises(ValueError):
+        parse_link("trojan://pw@:443#x")
+
+
+def test_hysteria2_missing_server_raises():
+    with pytest.raises(ValueError):
+        parse_link("hysteria2://pw@:443#x")
+
+
+def test_tuic_missing_server_raises():
+    with pytest.raises(ValueError):
+        parse_link("tuic://uuid-1:pw@:443#x")
+
+
+def test_vmess_non_dict_json_raises():
+    link = "vmess://" + base64.b64encode(b"[1, 2, 3]").decode()
+    with pytest.raises(ValueError):
+        parse_link(link)
+
+
+def test_vmess_missing_uuid_raises():
+    data = {"v": "2", "add": "v.example.com", "port": "443"}  # no 'id'
+    link = "vmess://" + base64.b64encode(json.dumps(data).encode()).decode()
+    with pytest.raises(ValueError):
+        parse_link(link)
+
+
+def test_ss_sip002_userinfo_without_colon_raises():
+    userinfo = base64.b64encode(b"no-colon-here").decode()
+    with pytest.raises(ValueError):
+        parse_link(f"ss://{userinfo}@s.example.com:8388#x")
+
+
+def test_ss_legacy_malformed_raises():
+    raw = base64.b64encode(b"just-some-text-without-structure").decode()
+    with pytest.raises(ValueError):
+        parse_link(f"ss://{raw}#x")
+
+
+def test_ss_legacy_userinfo_without_colon_raises():
+    raw = base64.b64encode(b"nocolon@host:8388").decode()
+    with pytest.raises(ValueError):
+        parse_link(f"ss://{raw}#x")
+
+
+def test_ss_legacy_host_without_port_raises():
+    raw = base64.b64encode(b"aes-256-gcm:pw@hostnoport").decode()
+    with pytest.raises(ValueError):
+        parse_link(f"ss://{raw}#x")

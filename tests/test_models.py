@@ -46,3 +46,79 @@ def test_vlessprofile_roundtrip():
     assert p2.port == 8443
     assert p2.protocol == "trojan"
     assert p2.password == "pw"
+
+
+# --- AppSettings: input sanitising -------------------------------------------
+
+def test_subscriptions_strip_blanks_and_whitespace():
+    s = AppSettings.from_dict({"subscriptions": ["https://a", "", "   ", "https://b"]})
+    assert s.subscriptions == ["https://a", "https://b"]
+
+
+def test_routing_rules_without_value_dropped():
+    s = AppSettings.from_dict({"routing_rules": [
+        {"kind": "domain_suffix", "value": "example.com", "action": "proxy"},
+        {"kind": "domain_suffix", "value": "", "action": "proxy"},   # no value -> dropped
+    ]})
+    assert s.routing_rules == [{"kind": "domain_suffix", "value": "example.com", "action": "proxy"}]
+
+
+def test_routing_rule_defaults_filled():
+    s = AppSettings.from_dict({"routing_rules": [{"value": "x.com"}]})
+    assert s.routing_rules == [{"kind": "domain_suffix", "value": "x.com", "action": "direct"}]
+
+
+def test_process_rules_mapped():
+    s = AppSettings.from_dict({"process_rules": [{"process_name": "tg.exe", "outbound": "proxy"}]})
+    assert s.process_rules == [{"process_name": "tg.exe", "outbound": "proxy"}]
+
+
+def test_subscription_info_drops_non_dict_entries():
+    s = AppSettings.from_dict({"subscription_info": {"u1": {"used": 1}, "u2": "bad"}})
+    assert s.subscription_info == {"u1": {"used": 1}}
+
+
+def test_subscription_titles_roundtrip_and_coercion():
+    s = AppSettings(subscription_titles={"https://x": "My Sub"})
+    assert AppSettings.from_dict(s.to_dict()).subscription_titles == {"https://x": "My Sub"}
+    # Values coerced to str on load.
+    assert AppSettings.from_dict({"subscription_titles": {"u": 123}}).subscription_titles == {"u": "123"}
+
+
+def test_subscription_titles_default_empty():
+    assert AppSettings().subscription_titles == {}
+    assert AppSettings.from_dict({}).subscription_titles == {}
+
+
+def test_last_seen_version_default_empty():
+    assert AppSettings().last_seen_version == ""
+    assert AppSettings.from_dict({}).last_seen_version == ""
+
+
+def test_appsettings_ignores_unknown_keys():
+    # Forward/backward compatibility: an unknown key from a newer build must not crash load.
+    s = AppSettings.from_dict({"language": "en", "totally_new_field": 123})
+    assert s.language == "en"
+
+
+# --- VlessProfile: coercion and tolerance ------------------------------------
+
+def test_alter_id_coercion():
+    assert VlessProfile.from_dict({"name": "n", "uuid": "u", "server": "h", "port": 443}).alter_id == 0
+    assert VlessProfile.from_dict({"name": "n", "uuid": "u", "server": "h", "port": 443,
+                                   "alter_id": None}).alter_id == 0
+    assert VlessProfile.from_dict({"name": "n", "uuid": "u", "server": "h", "port": 443,
+                                   "alter_id": "3"}).alter_id == 3
+
+
+def test_vlessprofile_from_dict_ignores_unknown_keys():
+    p = VlessProfile.from_dict({"name": "n", "uuid": "u", "server": "h", "port": 443, "bogus": "x"})
+    assert p.name == "n"
+    assert p.server == "h"
+
+
+def test_to_dict_coerces_port_and_enabled():
+    p = VlessProfile(name="n", uuid="u", server="h", port=443)
+    d = p.to_dict()
+    assert isinstance(d["port"], int)
+    assert isinstance(d["enabled"], bool)

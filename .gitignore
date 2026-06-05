@@ -224,6 +224,8 @@ installer_output/
 _test_*.json
 .sixth/
 memory/
+# Internal QA/release checklist — kept local, not published.
+SMOKE_CHECKLIST.md
 
 # Personal data safety net.
 # Real user data lives in %LOCALAPPDATA%\vless_manager, NOT in this folder —

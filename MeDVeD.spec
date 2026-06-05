@@ -12,7 +12,9 @@ datas += collect_data_files('customtkinter')
 
 hiddenimports = []
 hiddenimports += collect_submodules('pystray')
-hiddenimports += ['PIL.Image', 'PIL.ImageDraw', 'yaml']
+# PIL.ImageTk is imported lazily inside flags.py (procedural country flags) — list
+# it explicitly so the frozen build can turn a flag image into a Tk PhotoImage.
+hiddenimports += ['PIL.Image', 'PIL.ImageDraw', 'PIL.ImageTk', 'yaml']
 
 
 datas += [
