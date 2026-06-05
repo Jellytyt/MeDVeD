@@ -37,7 +37,7 @@ from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -498,6 +498,82 @@ def _cleanup_stale_tun_adapters() -> None:
                     capture_output=True, timeout=3,
                     creationflags=creationflags,
                 )
+    except Exception:
+        pass
+
+
+_singbox_job_handle = None
+
+
+def _assign_process_to_kill_job(process) -> None:
+    """Tie sing-box to a Windows Job object with KILL_ON_JOB_CLOSE, so that if
+    our process dies for ANY reason — crash, Task Manager, power loss — Windows
+    kills sing-box with it. Without this an orphaned sing-box keeps its TUN up
+    and hijacks the system routes/DNS (no internet, ~1ms local pings) until the
+    next launch cleans it. The job handle is deliberately kept open for the
+    app's lifetime: its closing is exactly the kill trigger. Best-effort — on
+    any failure we silently fall back to plain termination on disconnect."""
+    global _singbox_job_handle
+    if os.name != "nt":
+        return
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        if _singbox_job_handle is None:
+            JobObjectExtendedLimitInformation = 9
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+            class _BasicLimit(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _IoCounters(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_uint64) for n in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+                )]
+
+            class _ExtendedLimit(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _BasicLimit),
+                    ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return
+            info = _ExtendedLimit()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ]
+            if not kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+            ):
+                kernel32.CloseHandle(job)
+                return
+            _singbox_job_handle = job
+
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject(_singbox_job_handle, int(process._handle))
     except Exception:
         pass
 
@@ -2305,6 +2381,9 @@ class VlessApp(ctk.CTk):
                     errors="replace",
                     creationflags=creationflags,
                 )
+                # Bind to a kill-on-close Job object before it does anything, so a
+                # hard exit of this app can't leave an orphaned tunnel behind.
+                _assign_process_to_kill_job(new_process)
                 setattr(new_process, "_mvd_user_disconnect", False)
                 with self._process_lock:
                     self.process = new_process
