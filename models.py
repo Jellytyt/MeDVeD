@@ -101,6 +101,17 @@ class AppSettings:
     bypass_ru: bool = False
     kill_switch: bool = False
     urltest_auto_switch: bool = True
+    # Anti-DPI (TSPU/Roskomnadzor): record_fragment splits the TLS ClientHello so
+    # SNI-based DPI can't read it; utls_fingerprint masks the TLS client. "auto"
+    # keeps the per-profile fingerprint from the share link. Fragmentation is ON
+    # by default — the censorship environment it targets is the common case here.
+    # tls_fragment_aggressive switches record_fragment -> the heavier `fragment`.
+    # doh_dns routes resolution through encrypted DNS over the tunnel (anti-DNS-
+    # poisoning); opt-in because it changes the critical DNS path.
+    tls_fragment: bool = True
+    tls_fragment_aggressive: bool = False
+    utls_fingerprint: str = "auto"
+    doh_dns: bool = False
     auto_start_with_windows: bool = False
     start_minimized: bool = False
     appearance_mode: str = "dark"
@@ -132,6 +143,10 @@ class AppSettings:
             bypass_ru=bool(data.get("bypass_ru", False)),
             kill_switch=bool(data.get("kill_switch", False)),
             urltest_auto_switch=bool(data.get("urltest_auto_switch", True)),
+            tls_fragment=bool(data.get("tls_fragment", True)),
+            tls_fragment_aggressive=bool(data.get("tls_fragment_aggressive", False)),
+            utls_fingerprint=str(data.get("utls_fingerprint", "auto") or "auto"),
+            doh_dns=bool(data.get("doh_dns", False)),
             auto_start_with_windows=bool(data.get("auto_start_with_windows", False)),
             start_minimized=bool(data.get("start_minimized", False)),
             appearance_mode=str(data.get("appearance_mode", "dark")),

@@ -14,6 +14,10 @@ def build_sing_box_config(
     use_urltest: bool = True,
     urltest_interval: str = "5m",
     delay_test_profiles=None,
+    utls_fingerprint: str = "auto",
+    tls_fragment: bool = False,
+    tls_fragment_aggressive: bool = False,
+    doh_dns: bool = False,
 ) -> Dict[str, Any]:
     # Accept a single profile (legacy) or a list (URLTest/selector).
     if isinstance(profiles, VlessProfile):
@@ -25,13 +29,13 @@ def build_sing_box_config(
 
     proxy_outbounds: List[Dict[str, Any]] = []
     if len(profile_list) == 1:
-        outbound = _build_outbound(profile_list[0])
+        outbound = _build_outbound(profile_list[0], utls_fingerprint, tls_fragment, tls_fragment_aggressive)
         outbound["tag"] = "proxy"
         proxy_outbounds.append(_prune_none_values(outbound))
     else:
         member_tags: List[str] = []
         for index, profile in enumerate(profile_list):
-            out = _build_outbound(profile)
+            out = _build_outbound(profile, utls_fingerprint, tls_fragment, tls_fragment_aggressive)
             out["tag"] = f"proxy-{index}"
             proxy_outbounds.append(_prune_none_values(out))
             member_tags.append(out["tag"])
@@ -118,14 +122,33 @@ def build_sing_box_config(
     }
     if rule_sets:
         route["rule_set"] = rule_sets
-        route["default_domain_resolver"] = "dns-local"
 
-    dns_block: Dict[str, Any] = {
-        "servers": [{"type": "local", "tag": "dns-local"}],
-        "final": "dns-local",
-    }
+    if doh_dns:
+        # Encrypted DNS (DoH) over the tunnel so TSPU can't spoof resolution.
+        # Reached via detour=proxy and by IP (1.1.1.1), so the DoH endpoint
+        # itself needs no prior resolution. The plain local resolver stays as a
+        # bootstrap (see default_domain_resolver below) — outbound *server*
+        # domains must resolve directly, or we'd need the tunnel to resolve the
+        # tunnel's own server (a loop).
+        dns_block: Dict[str, Any] = {
+            "servers": [
+                {"type": "https", "tag": "dns-doh", "server": "1.1.1.1", "detour": "proxy"},
+                {"type": "local", "tag": "dns-local"},
+            ],
+            "final": "dns-doh",
+        }
+    else:
+        dns_block = {
+            "servers": [{"type": "local", "tag": "dns-local"}],
+            "final": "dns-local",
+        }
     if dns_rules:
         dns_block["rules"] = dns_rules
+
+    # Resolve outbound server addresses (and geosite-ru rules) via the direct
+    # local resolver, so DoH-over-proxy can't create a bootstrap loop.
+    if rule_sets or doh_dns:
+        route["default_domain_resolver"] = "dns-local"
 
     # Dormant per-server outbounds for latency probing via the Clash API
     # (/proxies/dt-N/delay) while connected — the same metric Karing shows. They
@@ -135,7 +158,7 @@ def build_sing_box_config(
     delay_outbounds: List[Dict[str, Any]] = []
     for index, profile in enumerate(delay_test_profiles or []):
         try:
-            out = _build_outbound(profile)
+            out = _build_outbound(profile, utls_fingerprint, tls_fragment, tls_fragment_aggressive)
         except Exception:
             continue
         out["tag"] = f"dt-{index}"
@@ -175,7 +198,7 @@ def build_sing_box_config(
     }
 
 
-def _build_outbound(profile: VlessProfile) -> Dict[str, Any]:
+def _build_outbound(profile: VlessProfile, utls_fingerprint: str = "auto", tls_fragment: bool = False, tls_fragment_aggressive: bool = False) -> Dict[str, Any]:
     proto = (profile.protocol or "vless").lower()
 
     if proto == "vless":
@@ -188,7 +211,7 @@ def _build_outbound(profile: VlessProfile) -> Dict[str, Any]:
             "flow": profile.flow or None,
             "packet_encoding": "xudp",
             "transport": _build_transport(profile),
-            "tls": _build_tls(profile),
+            "tls": _build_tls(profile, utls_fingerprint, tls_fragment, tls_fragment_aggressive),
         }
 
     if proto == "vmess":
@@ -202,7 +225,7 @@ def _build_outbound(profile: VlessProfile) -> Dict[str, Any]:
             "alter_id": int(profile.alter_id or 0),
             "packet_encoding": "xudp",
             "transport": _build_transport(profile),
-            "tls": _build_tls(profile) if profile.security in ("tls", "reality") else {"enabled": False},
+            "tls": _build_tls(profile, utls_fingerprint, tls_fragment, tls_fragment_aggressive) if profile.security in ("tls", "reality") else {"enabled": False},
         }
 
     if proto == "trojan":
@@ -213,7 +236,7 @@ def _build_outbound(profile: VlessProfile) -> Dict[str, Any]:
             "server_port": profile.port,
             "password": profile.password,
             "transport": _build_transport(profile),
-            "tls": _build_tls(profile),
+            "tls": _build_tls(profile, utls_fingerprint, tls_fragment, tls_fragment_aggressive),
         }
 
     if proto == "shadowsocks":
@@ -267,15 +290,22 @@ def _build_outbound(profile: VlessProfile) -> Dict[str, Any]:
     raise ValueError(f"Unsupported protocol: {profile.protocol!r}")
 
 
-def _build_tls(profile: VlessProfile) -> Dict[str, Any]:
+def _build_tls(profile: VlessProfile, utls_fingerprint: str = "auto", tls_fragment: bool = False, tls_fragment_aggressive: bool = False) -> Dict[str, Any]:
+    # "auto" (default) keeps the per-profile fingerprint from the share link;
+    # an explicit choice (e.g. "firefox"/"randomized") overrides every server,
+    # to dodge TLS-client fingerprinting by DPI.
+    fingerprint = utls_fingerprint if utls_fingerprint and utls_fingerprint != "auto" else (profile.fp or "chrome")
+
     if profile.security == "reality":
+        # Reality borrows a real site's handshake (its SNI is a legit allowed
+        # domain), so SNI-fragmentation is neither needed nor safe here.
         return _prune_none_values(
             {
                 "enabled": True,
                 "server_name": profile.sni or profile.server,
                 "utls": {
                     "enabled": True,
-                    "fingerprint": profile.fp or "chrome",
+                    "fingerprint": fingerprint,
                 },
                 "reality": {
                     "enabled": True,
@@ -286,18 +316,26 @@ def _build_tls(profile: VlessProfile) -> Dict[str, Any]:
         )
 
     if profile.security == "tls":
-        alpn_values = _split_csv(profile.alpn)
-        return _prune_none_values(
-            {
+        block: Dict[str, Any] = {
+            "enabled": True,
+            "server_name": profile.sni or profile.server,
+            "utls": {
                 "enabled": True,
-                "server_name": profile.sni or profile.server,
-                "utls": {
-                    "enabled": True,
-                    "fingerprint": profile.fp or "chrome",
-                },
-                "alpn": alpn_values,
-            }
-        )
+                "fingerprint": fingerprint,
+            },
+            "alpn": _split_csv(profile.alpn),
+        }
+        if tls_fragment:
+            # Split the ClientHello so SNI-based DPI (e.g. Russian TSPU) can't
+            # read the destination host. record_fragment is the performance-
+            # friendly variant sing-box recommends first; the heavier `fragment`
+            # (packet-level) is the aggressive fallback for stubborn DPI.
+            if tls_fragment_aggressive:
+                block["fragment"] = True
+                block["fragment_fallback_delay"] = "500ms"
+            else:
+                block["record_fragment"] = True
+        return _prune_none_values(block)
 
     return {"enabled": False}
 

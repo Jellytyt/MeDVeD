@@ -37,7 +37,7 @@ from parser import parse_link, profile_to_link
 from storage import get_user_data_root, load_profiles, load_settings, save_profiles, save_settings
 
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 GITHUB_REPO = "Jellytyt/MeDVeD"
 
 
@@ -807,6 +807,10 @@ class VlessApp(ctk.CTk):
         self.bypass_ru_var = BooleanVar(value=self.settings.bypass_ru)
         self.kill_switch_var = BooleanVar(value=self.settings.kill_switch)
         self.urltest_auto_switch_var = BooleanVar(value=self.settings.urltest_auto_switch)
+        self.tls_fragment_var = BooleanVar(value=self.settings.tls_fragment)
+        self.tls_fragment_aggressive_var = BooleanVar(value=self.settings.tls_fragment_aggressive)
+        self.utls_fingerprint_var = StringVar(value=self.settings.utls_fingerprint)
+        self.doh_dns_var = BooleanVar(value=self.settings.doh_dns)
         self.autostart_var = BooleanVar(value=self.settings.auto_start_with_windows)
         self.start_minimized_var = BooleanVar(value=self.settings.start_minimized)
         self.appearance_var = StringVar(value=self.settings.appearance_mode)
@@ -2206,6 +2210,10 @@ class VlessApp(ctk.CTk):
                 routing_rules=self.settings.routing_rules,
                 use_urltest=self.settings.urltest_auto_switch,
                 delay_test_profiles=dt_profiles,
+                utls_fingerprint=self.settings.utls_fingerprint,
+                tls_fragment=self.settings.tls_fragment,
+                tls_fragment_aggressive=self.settings.tls_fragment_aggressive,
+                doh_dns=self.settings.doh_dns,
             )
         except Exception as error:
             self._show_toast("Ошибка конфига", str(error), "error")
@@ -2676,6 +2684,12 @@ class VlessApp(ctk.CTk):
         self.settings.kill_switch = bool(self.kill_switch_var.get())
         if was_kill_switch and not self.settings.kill_switch:
             _kill_switch_release()
+        self.settings.tls_fragment = bool(self.tls_fragment_var.get())
+        self.settings.tls_fragment_aggressive = bool(self.tls_fragment_aggressive_var.get())
+        self.settings.doh_dns = bool(self.doh_dns_var.get())
+        fp_choice = str(self.utls_fingerprint_var.get())
+        if fp_choice in self._UTLS_FINGERPRINTS:
+            self.settings.utls_fingerprint = fp_choice
         try:
             self.settings.subscription_refresh_hours = max(0, int(self.subscription_refresh_var.get() or 0))
         except ValueError:
@@ -3098,6 +3112,10 @@ class VlessApp(ctk.CTk):
             if not click_inside(self._server_dropdown) and not click_inside(self.server_button):
                 self._hide_server_menu()
 
+    # uTLS fingerprints sing-box accepts; "auto" is our sentinel meaning "use the
+    # per-profile fingerprint from the share link" (not passed to sing-box).
+    _UTLS_FINGERPRINTS = ("auto", "chrome", "firefox", "safari", "edge", "ios", "android", "randomized")
+
     def _build_settings_view(self) -> None:
         view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self._view_header(view, "Настройки", back=True)
@@ -3145,6 +3163,38 @@ class VlessApp(ctk.CTk):
             textvariable=self.subscription_refresh_var, style="Dark.TSpinbox",
         ).pack(side=LEFT, padx=6)
         ctk.CTkLabel(refresh_row, text="ч (0 = выключено)").pack(side=LEFT)
+
+        # ---------- Anti-DPI (TSPU / Roskomnadzor) ----------
+        ctk.CTkLabel(
+            wrapper, text="Обход блокировок (DPI / ТСПУ)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(anchor="w", pady=(16, 4))
+        ctk.CTkLabel(
+            wrapper,
+            text="Помогает на обычных TLS-серверах, когда провайдер режет по имени сайта "
+                 "(SNI). Применяется после переподключения. Серверам с Reality не нужно.",
+            font=ctk.CTkFont(size=10), text_color="#aaaaaa",
+            wraplength=560, justify="left",
+        ).pack(anchor="w")
+        ctk.CTkCheckBox(
+            wrapper, text="Фрагментация TLS — прятать SNI от DPI (вкл по умолчанию)",
+            variable=self.tls_fragment_var,
+        ).pack(anchor="w", pady=4)
+        ctk.CTkCheckBox(
+            wrapper, text="↳ Агрессивный режим (fragment) — если обычной мало; медленнее",
+            variable=self.tls_fragment_aggressive_var,
+        ).pack(anchor="w", padx=(24, 0), pady=(0, 4))
+        ctk.CTkCheckBox(
+            wrapper, text="Шифрованный DNS (DoH через туннель) — защита от подмены DNS",
+            variable=self.doh_dns_var,
+        ).pack(anchor="w", pady=4)
+        fp_row = ctk.CTkFrame(wrapper, fg_color="transparent")
+        fp_row.pack(fill=X, pady=(2, 0))
+        ctk.CTkLabel(fp_row, text="Маскировка TLS (uTLS):").pack(side=LEFT)
+        ctk.CTkOptionMenu(
+            fp_row, variable=self.utls_fingerprint_var,
+            values=list(self._UTLS_FINGERPRINTS), width=140,
+        ).pack(side=LEFT, padx=(6, 0))
 
         ctk.CTkLabel(
             wrapper, text="Правила по процессам (роутинг по имени exe)",
@@ -3278,6 +3328,10 @@ class VlessApp(ctk.CTk):
             self.bypass_ru_var,
             self.kill_switch_var,
             self.urltest_auto_switch_var,
+            self.tls_fragment_var,
+            self.tls_fragment_aggressive_var,
+            self.utls_fingerprint_var,
+            self.doh_dns_var,
             self.appearance_var,
             self.language_var,
             self.subscription_refresh_var,
@@ -4172,6 +4226,8 @@ class VlessApp(ctk.CTk):
             f"bypass_ru={s.bypass_ru}, kill_switch={s.kill_switch}, "
             f"urltest={s.urltest_auto_switch}, autostart={s.auto_start_with_windows}, "
             f"min_to_tray={s.minimize_to_tray}, refresh_h={s.subscription_refresh_hours}, "
+            f"tls_fragment={s.tls_fragment}, aggressive={s.tls_fragment_aggressive}, "
+            f"utls_fp={s.utls_fingerprint}, doh_dns={s.doh_dns}, "
             f"theme={s.appearance_mode}, lang={s.language}"
         )
 

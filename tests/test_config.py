@@ -301,6 +301,90 @@ def test_no_delay_test_profiles_means_no_dt_outbounds():
     assert not any(o["tag"].startswith("dt-") for o in cfg["outbounds"])
 
 
+# --- anti-DPI: uTLS fingerprint + TLS fragmentation ---------------------------
+
+def test_fingerprint_auto_keeps_profile_value():
+    assert _build_tls(_profile(security="tls", fp="firefox"))["utls"]["fingerprint"] == "firefox"
+    assert _build_tls(_profile(security="tls", fp=""))["utls"]["fingerprint"] == "chrome"
+
+
+def test_fingerprint_explicit_override_wins():
+    tls = _build_tls(_profile(security="tls", fp="chrome"), utls_fingerprint="randomized")
+    assert tls["utls"]["fingerprint"] == "randomized"
+
+
+def test_fingerprint_override_applies_to_reality_too():
+    tls = _build_tls(_profile(security="reality", public_key="PK", short_id="ab"), utls_fingerprint="firefox")
+    assert tls["utls"]["fingerprint"] == "firefox"
+
+
+def test_tls_fragment_adds_record_fragment():
+    assert _build_tls(_profile(security="tls"), tls_fragment=True).get("record_fragment") is True
+
+
+def test_tls_fragment_off_by_default():
+    assert "record_fragment" not in _build_tls(_profile(security="tls"))
+
+
+def test_reality_is_never_fragmented():
+    # Reality borrows a real handshake — fragmenting it would break it.
+    tls = _build_tls(_profile(security="reality", public_key="PK", short_id="ab"), tls_fragment=True)
+    assert "record_fragment" not in tls
+
+
+def test_build_config_threads_fragment_and_fingerprint_to_proxy():
+    proxy = _proxy_with(_profile(protocol="vless", security="tls", fp="chrome"),
+                        utls_fingerprint="firefox", tls_fragment=True)
+    assert proxy["tls"]["record_fragment"] is True
+    assert proxy["tls"]["utls"]["fingerprint"] == "firefox"
+
+
+def _proxy_with(profile, **kw):
+    cfg = build_sing_box_config(profile, **kw)
+    return next(o for o in cfg["outbounds"] if o.get("tag") == "proxy")
+
+
+def test_fragment_aggressive_uses_packet_fragment():
+    tls = _build_tls(_profile(security="tls"), tls_fragment=True, tls_fragment_aggressive=True)
+    assert tls.get("fragment") is True
+    assert tls.get("fragment_fallback_delay") == "500ms"
+    assert "record_fragment" not in tls
+
+
+def test_fragment_normal_uses_record_fragment():
+    tls = _build_tls(_profile(security="tls"), tls_fragment=True, tls_fragment_aggressive=False)
+    assert tls.get("record_fragment") is True
+    assert "fragment" not in tls
+
+
+# --- DoH (encrypted DNS) ------------------------------------------------------
+
+def test_doh_dns_block_and_bootstrap():
+    cfg = build_sing_box_config(_profile(), doh_dns=True)
+    servers = {s["tag"]: s for s in cfg["dns"]["servers"]}
+    assert cfg["dns"]["final"] == "dns-doh"
+    assert servers["dns-doh"]["type"] == "https"
+    assert servers["dns-doh"]["detour"] == "proxy"
+    assert "dns-local" in servers  # bootstrap resolver kept
+    # outbound server domains must resolve directly to avoid a DoH bootstrap loop
+    assert cfg["route"]["default_domain_resolver"] == "dns-local"
+
+
+def test_no_doh_by_default():
+    cfg = build_sing_box_config(_profile())
+    assert cfg["dns"]["final"] == "dns-local"
+    assert not any(s.get("type") == "https" for s in cfg["dns"]["servers"])
+    assert "default_domain_resolver" not in cfg["route"]
+
+
+def test_doh_coexists_with_bypass_ru():
+    cfg = build_sing_box_config(_profile(), bypass_ru=True, doh_dns=True)
+    assert cfg["dns"]["final"] == "dns-doh"
+    assert cfg["route"]["default_domain_resolver"] == "dns-local"
+    # geosite-ru DNS rule still present (routes RU domains to the local resolver)
+    assert any(r.get("rule_set") == "geosite-ru" for r in cfg["dns"].get("rules", []))
+
+
 def _proxy(profile):
     """The single 'proxy' outbound produced for one profile."""
     cfg = build_sing_box_config(profile)

@@ -90,6 +90,42 @@ def test_subscription_titles_default_empty():
     assert AppSettings.from_dict({}).subscription_titles == {}
 
 
+def test_anti_dpi_defaults():
+    s = AppSettings()
+    assert s.tls_fragment is True   # ON by default (TSPU is the common case here)
+    assert s.utls_fingerprint == "auto"
+    assert AppSettings.from_dict({}).tls_fragment is True
+    assert AppSettings.from_dict({}).utls_fingerprint == "auto"
+
+
+def test_tls_fragment_can_be_disabled():
+    assert AppSettings.from_dict({"tls_fragment": False}).tls_fragment is False
+
+
+def test_aggressive_fragment_and_doh_defaults_off():
+    s = AppSettings()
+    assert s.tls_fragment_aggressive is False
+    assert s.doh_dns is False
+    assert AppSettings.from_dict({}).tls_fragment_aggressive is False
+    assert AppSettings.from_dict({}).doh_dns is False
+
+
+def test_aggressive_fragment_and_doh_roundtrip():
+    s = AppSettings(tls_fragment_aggressive=True, doh_dns=True)
+    s2 = AppSettings.from_dict(s.to_dict())
+    assert s2.tls_fragment_aggressive is True
+    assert s2.doh_dns is True
+
+
+def test_anti_dpi_roundtrip_and_coercion():
+    s = AppSettings(tls_fragment=True, utls_fingerprint="firefox")
+    s2 = AppSettings.from_dict(s.to_dict())
+    assert s2.tls_fragment is True
+    assert s2.utls_fingerprint == "firefox"
+    # junk fingerprint falls back to "auto"
+    assert AppSettings.from_dict({"utls_fingerprint": None}).utls_fingerprint == "auto"
+
+
 def test_last_seen_version_default_empty():
     assert AppSettings().last_seen_version == ""
     assert AppSettings.from_dict({}).last_seen_version == ""
